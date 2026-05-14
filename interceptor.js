@@ -34,8 +34,8 @@
     'securetoken.googleapis.com'
   ];
 
-  // Max body size to capture (250KB). Larger payloads get truncated.
-  const MAX_BODY_SIZE = 256000;
+  // Max body size to capture (1 MB). Workflow builder payloads can be huge.
+  const MAX_BODY_SIZE = 1048576;
 
   // Headers we redact (truncate long token values) but still capture.
   // Everything else is captured verbatim so requests are replayable.
@@ -304,6 +304,108 @@
 
     return originalSend.apply(this, arguments);
   };
+
+  // -----------------------------------------------------------------------
+  // Patch navigator.sendBeacon  (workflow autosave on navigation can use this)
+  // -----------------------------------------------------------------------
+
+  if (navigator.sendBeacon) {
+    const originalSendBeacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function (url, data) {
+      const result = originalSendBeacon(url, data);
+      try {
+        if (isApiUrl(url)) {
+          postCapture({
+            url,
+            method: 'POST',
+            status: 0,
+            requestBody: serializeRequestBody(data),
+            responseBody: null,
+            responseJson: null,
+            contentType: 'beacon',
+            requestHeaders: null,
+            responseHeaders: null,
+            authHeaders: null,
+            timestamp: Date.now()
+          });
+        }
+      } catch {}
+      return result;
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // Clipboard capture - GHL's "Copy step" / "Copy workflow" puts the
+  // canonical step JSON on the clipboard. That JSON IS the deploy format.
+  // -----------------------------------------------------------------------
+
+  function postClipboardCapture(content, source) {
+    try {
+      const text = typeof content === 'string' ? content : String(content);
+      if (!text || text.length < 2) return;
+      const truncated = text.length > MAX_BODY_SIZE
+        ? text.substring(0, MAX_BODY_SIZE) + '...[TRUNCATED]'
+        : text;
+      window.postMessage({
+        type: '__GHL_CLIPBOARD_CAPTURE__',
+        payload: {
+          content: truncated,
+          source,
+          length: text.length,
+          pageUrl: location.href,
+          pagePath: location.pathname,
+          looksLikeJson: /^\s*[{[]/.test(text),
+          timestamp: Date.now()
+        }
+      }, '*');
+    } catch {}
+  }
+
+  // Patch navigator.clipboard.writeText
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      const origWriteText = navigator.clipboard.writeText.bind(navigator.clipboard);
+      navigator.clipboard.writeText = function (text) {
+        try { postClipboardCapture(text, 'clipboard.writeText'); } catch {}
+        return origWriteText(text);
+      };
+    }
+
+    // Patch navigator.clipboard.write (ClipboardItem-based copies)
+    if (navigator.clipboard && navigator.clipboard.write) {
+      const origWrite = navigator.clipboard.write.bind(navigator.clipboard);
+      navigator.clipboard.write = function (items) {
+        try {
+          if (Array.isArray(items)) {
+            for (const item of items) {
+              if (item && typeof item.getType === 'function' && item.types) {
+                for (const t of item.types) {
+                  if (t.startsWith('text/') || t === 'application/json') {
+                    item.getType(t).then(blob => blob.text()).then(txt => {
+                      postClipboardCapture(txt, 'clipboard.write:' + t);
+                    }).catch(() => {});
+                  }
+                }
+              }
+            }
+          }
+        } catch {}
+        return origWrite(items);
+      };
+    }
+  } catch {}
+
+  // Listen for `copy` events (covers document.execCommand('copy') and native copies)
+  document.addEventListener('copy', (e) => {
+    try {
+      const cd = e.clipboardData || window.clipboardData;
+      if (!cd) return;
+      const text = cd.getData('text/plain') || cd.getData('text');
+      if (text) postClipboardCapture(text, 'copy-event:text/plain');
+      const json = cd.getData('application/json');
+      if (json) postClipboardCapture(json, 'copy-event:application/json');
+    } catch {}
+  }, true);
 
   // -----------------------------------------------------------------------
   // Console marker (visible in DevTools)

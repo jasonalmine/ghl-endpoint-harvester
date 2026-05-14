@@ -720,8 +720,8 @@ async function setupListeners() {
             let offset = 0;
             for (const p of parts) { combined.set(p, offset); offset += p.length; }
             body = new TextDecoder().decode(combined);
-            // Truncate large bodies
-            if (body.length > 102400) body = body.substring(0, 102400) + '...[TRUNCATED]';
+            // Truncate large bodies (1 MB cap — workflow payloads can be huge)
+            if (body.length > 1048576) body = body.substring(0, 1048576) + '...[TRUNCATED]';
           }
         } catch {}
       } else if (details.requestBody?.formData) {
@@ -984,6 +984,69 @@ async function storePayload(epKey, data) {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+
+  // Handle clipboard captures (Copy step / Copy workflow in GHL UI)
+  // Stored as a synthetic payload entry so the existing UI surfaces it.
+  if (msg.action === 'captureClipboard') {
+    const data = msg.data;
+    if (!data) return;
+    try {
+      // Synthetic key: CLIPBOARD <pagePath>  (groups copies per surface)
+      const path = (data.pagePath || '/').replace(/\/{2,}/g, '/');
+      const normalizedPath = normalizePath(path);
+      const epKey = `CLIPBOARD ${normalizedPath}`;
+      const now = data.timestamp || Date.now();
+
+      // Register a sibling endpoint entry so the main list surfaces it
+      getEndpoints().then(async (endpoints) => {
+        const ep = endpoints[epKey];
+        if (ep) {
+          ep.hitCount = (ep.hitCount || 0) + 1;
+          ep.lastSeen = now;
+          if (ep.sampleUrls && data.pageUrl && !ep.sampleUrls.includes(data.pageUrl)) {
+            ep.sampleUrls.unshift(data.pageUrl);
+            if (ep.sampleUrls.length > 3) ep.sampleUrls.pop();
+          }
+        } else {
+          endpoints[epKey] = {
+            method: 'CLIPBOARD',
+            pattern: normalizedPath,
+            domain: 'app.gohighlevel.com',
+            hitCount: 1,
+            firstSeen: now,
+            lastSeen: now,
+            sampleUrls: data.pageUrl ? [data.pageUrl] : [],
+            queryParams: [],
+            statusCodes: [],
+            authType: 'none',
+            apiStatus: 'clipboard',
+            tags: ['clipboard'],
+            notes: '',
+            starred: false
+          };
+        }
+        await chrome.storage.local.set({ endpoints });
+        updateBadge();
+      });
+
+      storePayload(epKey, {
+        method: 'CLIPBOARD',
+        url: data.pageUrl || null,
+        status: 0,
+        contentType: data.looksLikeJson ? 'application/json' : 'text/plain',
+        // Treat the copied content as the request body so the popup shows it
+        requestBody: data.content || null,
+        responseBody: null,
+        requestHeaders: null,
+        responseHeaders: null,
+        authHeaders: { source: data.source || 'clipboard' },
+        timestamp: data.timestamp || Date.now()
+      });
+    } catch (e) {
+      console.warn('GHL Payload Harvester: captureClipboard error', e.message);
+    }
+    return;
+  }
 
   // Handle body captures from the interceptor (via bridge.js)
   // This supplements the webRequest body capture with response bodies

@@ -9,15 +9,26 @@
 
 window.addEventListener('message', (event) => {
   if (event.source !== window) return;
-  if (!event.data || event.data.type !== '__GHL_ENDPOINT_HARVESTER__') return;
+  const t = event.data && event.data.type;
+  if (!t) return;
 
-  const payload = event.data.payload;
-  if (!payload || !payload.url) return;
+  if (t === '__GHL_ENDPOINT_HARVESTER__') {
+    const payload = event.data.payload;
+    if (!payload || !payload.url) return;
+    chrome.runtime.sendMessage({
+      action: 'captureBody',
+      data: payload
+    }).catch(() => {});
+    return;
+  }
 
-  chrome.runtime.sendMessage({
-    action: 'captureBody',
-    data: payload
-  }).catch(() => {
-    // Extension context invalidated (e.g., during reload)
-  });
+  if (t === '__GHL_CLIPBOARD_CAPTURE__') {
+    const payload = event.data.payload;
+    if (!payload) return;
+    chrome.runtime.sendMessage({
+      action: 'captureClipboard',
+      data: payload
+    }).catch(() => {});
+    return;
+  }
 });
