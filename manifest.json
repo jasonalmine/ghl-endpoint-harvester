@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "GHL Endpoint Harvester",
-  "version": "1.3.0",
-  "description": "Intercepts and catalogs undocumented GHL API endpoints as you navigate GoHighLevel, with request + response body capture.",
+  "name": "GHL Payload Harvester",
+  "version": "1.4.0",
+  "description": "Intercepts every GoHighLevel API call (documented or not) and captures full request + response payloads and headers for workflow reverse-engineering and automated deployment.",
   "permissions": [
     "webRequest",
     "storage",

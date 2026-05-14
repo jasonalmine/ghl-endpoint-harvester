@@ -1,14 +1,14 @@
 /**
- * GHL Endpoint Harvester - Fetch/XHR Interceptor (Content Script)
+ * GHL Payload Harvester - Fetch/XHR Interceptor (Content Script)
  *
  * Runs in MAIN world (same context as the page) at document_start,
  * so it can monkey-patch fetch() and XMLHttpRequest before GHL's
- * app code loads. Captures request and response bodies for matching
- * API endpoints and posts them to the extension via window.postMessage.
+ * app code loads. Captures full request + response bodies AND headers
+ * for every GHL API call and posts them to the extension via
+ * window.postMessage.
  *
- * Only captures bodies for endpoints that match CAPTURE_PATTERNS to
- * avoid memory bloat. Everything else is ignored at the body level
- * (the background.js webRequest listener still records the URL pattern).
+ * Designed for reverse-engineering undocumented endpoints to power
+ * automated workflow extraction & deployment.
  */
 
 (function () {
@@ -34,47 +34,34 @@
     'securetoken.googleapis.com'
   ];
 
-  // URL path patterns that trigger body capture.
-  // Broad enough to catch the important stuff, narrow enough to skip noise.
-  const CAPTURE_PATTERNS = [
-    /\/workflow\//,
-    /\/workflows\//,
-    /\/funnels\//,
-    /\/contacts\//,
-    /\/opportunities\//,
-    /\/conversations\//,
-    /\/calendars\//,
-    /\/campaigns\//,
-    /\/custom-fields\//,
-    /\/custom-values\//,
-    /\/custom-data\//,
-    /\/snippets\//,
-    /\/email-isv\//,
-    /\/social-media-posting\//,
-    /\/reporting\//,
-    /\/objects\//,
-    /\/links\//,
-    /\/phone-system\//,
-    /\/payments\//,
-    /\/invoices\//,
-    /\/products\//,
-    /\/locations\/[^/]+\/customFields/,
-    /\/locations\/[^/]+\/customValues/,
-    /\/locations\/[^/]+\/tags/,
-    /firebasestorage\.googleapis\.com/,
-    // Firebase: Firestore document reads/writes
-    /firestore\.googleapis\.com/,
-    // Firebase: Auth (sign-in, token exchange, account info)
-    /identitytoolkit\.googleapis\.com/,
-    // Firebase: Token refresh
-    /securetoken\.googleapis\.com/
-  ];
+  // Max body size to capture (250KB). Larger payloads get truncated.
+  const MAX_BODY_SIZE = 256000;
 
-  // Max body size to capture (100KB). Larger payloads get truncated.
-  const MAX_BODY_SIZE = 102400;
+  // Headers we redact (truncate long token values) but still capture.
+  // Everything else is captured verbatim so requests are replayable.
+  const SENSITIVE_HEADERS = new Set([
+    'authorization', 'token-id', 'x-api-key', 'api-key', 'cookie', 'set-cookie'
+  ]);
 
-  // Headers worth capturing for auth analysis
-  const AUTH_HEADERS = ['authorization', 'token-id', 'channel', 'source', 'version', 'x-api-key'];
+  // Response headers worth keeping (skip CORS/cache noise to save space)
+  const RESPONSE_HEADERS_DENY = new Set([
+    'access-control-allow-origin',
+    'access-control-allow-credentials',
+    'access-control-allow-methods',
+    'access-control-allow-headers',
+    'access-control-expose-headers',
+    'access-control-max-age',
+    'strict-transport-security',
+    'cross-origin-resource-policy',
+    'cross-origin-opener-policy',
+    'referrer-policy',
+    'x-content-type-options',
+    'x-frame-options',
+    'x-xss-protection',
+    'vary',
+    'server',
+    'date'
+  ]);
 
   // -----------------------------------------------------------------------
   // Helpers
@@ -84,16 +71,6 @@
     try {
       const u = new URL(url, location.origin);
       return API_DOMAINS.some(d => u.hostname === d || u.hostname.endsWith('.' + d));
-    } catch {
-      return false;
-    }
-  }
-
-  function shouldCaptureBody(url) {
-    try {
-      const u = new URL(url, location.origin);
-      const fullUrl = u.href;
-      return CAPTURE_PATTERNS.some(p => p.test(u.pathname) || p.test(fullUrl));
     } catch {
       return false;
     }
@@ -117,33 +94,77 @@
     }
   }
 
-  function extractAuthHeaders(headers) {
+  function redactValue(name, val) {
+    if (val == null) return val;
+    const v = String(val);
+    if (SENSITIVE_HEADERS.has(name) && v.length > 60) {
+      return v.substring(0, 20) + '...' + v.substring(v.length - 10);
+    }
+    return v;
+  }
+
+  // Extract ALL request headers (with redaction of sensitive token values).
+  // Sensitive headers are still captured (just truncated) so request shape
+  // is preserved while avoiding logging full tokens.
+  function extractAllHeaders(headers) {
     if (!headers) return null;
-    const captured = {};
-    // Headers can be a Headers object, plain object, or array of [key, val]
+    const out = {};
     if (headers instanceof Headers) {
-      for (const name of AUTH_HEADERS) {
-        const val = headers.get(name);
-        if (val) {
-          // Truncate tokens to first 20 + last 10 chars for readability
-          captured[name] = val.length > 60 ? val.substring(0, 20) + '...' + val.substring(val.length - 10) : val;
-        }
-      }
+      headers.forEach((val, key) => {
+        const lower = key.toLowerCase();
+        out[lower] = redactValue(lower, val);
+      });
     } else if (Array.isArray(headers)) {
       for (const [key, val] of headers) {
-        if (AUTH_HEADERS.includes(key.toLowerCase())) {
-          captured[key.toLowerCase()] = val.length > 60 ? val.substring(0, 20) + '...' + val.substring(val.length - 10) : val;
-        }
+        const lower = String(key).toLowerCase();
+        out[lower] = redactValue(lower, val);
       }
     } else if (typeof headers === 'object') {
       for (const [key, val] of Object.entries(headers)) {
-        if (AUTH_HEADERS.includes(key.toLowerCase())) {
-          const v = String(val);
-          captured[key.toLowerCase()] = v.length > 60 ? v.substring(0, 20) + '...' + v.substring(v.length - 10) : v;
-        }
+        const lower = String(key).toLowerCase();
+        out[lower] = redactValue(lower, val);
       }
     }
-    return Object.keys(captured).length > 0 ? captured : null;
+    return Object.keys(out).length > 0 ? out : null;
+  }
+
+  // Pull just the auth-related subset for backward compat with the popup UI
+  function pickAuthHeaders(allHeaders) {
+    if (!allHeaders) return null;
+    const AUTH_KEYS = ['authorization', 'token-id', 'channel', 'source', 'version', 'x-api-key', 'version-control'];
+    const out = {};
+    for (const k of AUTH_KEYS) {
+      if (allHeaders[k] != null) out[k] = allHeaders[k];
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  }
+
+  // Parse a "name: value\r\nname: value" string into a redacted map,
+  // skipping CORS/security noise.
+  function parseResponseHeaders(rawHeaderString) {
+    if (!rawHeaderString) return null;
+    const out = {};
+    const lines = rawHeaderString.trim().split(/[\r\n]+/);
+    for (const line of lines) {
+      const idx = line.indexOf(':');
+      if (idx === -1) continue;
+      const name = line.slice(0, idx).trim().toLowerCase();
+      const val = line.slice(idx + 1).trim();
+      if (RESPONSE_HEADERS_DENY.has(name)) continue;
+      out[name] = redactValue(name, val);
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  }
+
+  function responseHeadersToObject(headers) {
+    if (!headers) return null;
+    const out = {};
+    headers.forEach((val, key) => {
+      const lower = key.toLowerCase();
+      if (RESPONSE_HEADERS_DENY.has(lower)) return;
+      out[lower] = redactValue(lower, val);
+    });
+    return Object.keys(out).length > 0 ? out : null;
   }
 
   function postCapture(data) {
@@ -184,22 +205,23 @@
     // Call original fetch first
     const response = await originalFetch.apply(this, arguments);
 
-    // Only intercept API calls that match capture patterns
-    if (!isApiUrl(url) || !shouldCaptureBody(url)) {
+    // Capture for any GHL API call. No pattern filter — we want everything.
+    if (!isApiUrl(url)) {
       return response;
     }
 
     try {
       const method = (init?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
 
-      // Extract auth headers from the request
       const reqHeaders = init?.headers || (input instanceof Request ? input.headers : null);
-      const authHeaders = extractAuthHeaders(reqHeaders);
+      const requestHeaders = extractAllHeaders(reqHeaders);
+      const authHeaders = pickAuthHeaders(requestHeaders);
+
+      const responseHeaders = responseHeadersToObject(response.headers);
 
       // Clone the response so we can read the body without consuming it
       const clone = response.clone();
 
-      // Read response body asynchronously (don't block the app)
       clone.text().then(responseText => {
         const requestBody = serializeRequestBody(init?.body || (input instanceof Request ? input.body : null));
 
@@ -211,6 +233,8 @@
           responseBody: truncateBody(responseText),
           responseJson: safeParseJson(responseText),
           contentType: response.headers.get('content-type') || null,
+          requestHeaders,
+          responseHeaders,
           authHeaders,
           timestamp: Date.now()
         });
@@ -239,8 +263,9 @@
   };
 
   XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
-    if (this.__ghl_headers && AUTH_HEADERS.includes(name.toLowerCase())) {
-      this.__ghl_headers[name.toLowerCase()] = value.length > 60 ? value.substring(0, 20) + '...' + value.substring(value.length - 10) : value;
+    if (this.__ghl_headers) {
+      const lower = String(name).toLowerCase();
+      this.__ghl_headers[lower] = redactValue(lower, value);
     }
     return originalSetRequestHeader.apply(this, arguments);
   };
@@ -249,13 +274,15 @@
     const url = this.__ghl_url;
     const method = (this.__ghl_method || 'GET').toUpperCase();
 
-    if (url && isApiUrl(url) && shouldCaptureBody(url)) {
+    if (url && isApiUrl(url)) {
       const requestBody = serializeRequestBody(body);
 
-      const capturedHeaders = Object.keys(this.__ghl_headers || {}).length > 0 ? { ...this.__ghl_headers } : null;
+      const requestHeaders = Object.keys(this.__ghl_headers || {}).length > 0 ? { ...this.__ghl_headers } : null;
+      const authHeaders = pickAuthHeaders(requestHeaders);
 
       this.addEventListener('load', function () {
         try {
+          const responseHeaders = parseResponseHeaders(this.getAllResponseHeaders());
           postCapture({
             url: this.__ghl_url,
             method,
@@ -264,7 +291,9 @@
             responseBody: truncateBody(this.responseText),
             responseJson: safeParseJson(this.responseText),
             contentType: this.getResponseHeader('content-type') || null,
-            authHeaders: capturedHeaders,
+            requestHeaders,
+            responseHeaders,
+            authHeaders,
             timestamp: Date.now()
           });
         } catch (e) {
@@ -281,7 +310,7 @@
   // -----------------------------------------------------------------------
 
   console.log(
-    '%c[GHL Endpoint Harvester] %cInterceptor active - capturing API response bodies',
+    '%c[GHL Payload Harvester] %cInterceptor active - capturing full requests + responses for all GHL API calls',
     'color: #4ade80; font-weight: bold;',
     'color: #888;'
   );

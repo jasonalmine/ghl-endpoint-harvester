@@ -439,8 +439,11 @@ async function pushPayloadToVault(epKey, payloadData) {
         contentType: payloadData.contentType || null,
         requestBody: payloadData.requestBody || null,
         responseBody: payloadData.responseBody || null,
+        requestHeaders: payloadData.requestHeaders || null,
+        responseHeaders: payloadData.responseHeaders || null,
         authHeaders: payloadData.authHeaders || null,
-        capturedAt: payloadData.capturedAt || Date.now()
+        capturedAt: payloadData.capturedAt || Date.now(),
+        samples: payloadData.samples || null
       },
       source: 'ghl-endpoint-harvester',
       pushedAt: new Date().toISOString()
@@ -799,18 +802,26 @@ async function setupListeners() {
           const normalizedPath = normalizePath(u.pathname);
           const epKey = `${method} ${normalizedPath}`;
 
-          // Extract auth headers from in-flight data
+          // Capture ALL request headers (with token redaction) so requests
+          // can be replayed / inspected for workflow extraction.
+          let requestHeaders = null;
           let authHeaders = null;
           if (headers && headers.length > 0) {
-            const AUTH_NAMES = ['authorization', 'token-id', 'channel', 'source', 'version', 'x-api-key'];
-            const captured = {};
+            const SENSITIVE = new Set(['authorization', 'token-id', 'x-api-key', 'api-key', 'cookie']);
+            const AUTH_KEYS = new Set(['authorization', 'token-id', 'channel', 'source', 'version', 'x-api-key', 'version-control']);
+            requestHeaders = {};
+            const auth = {};
             for (const h of headers) {
-              if (AUTH_NAMES.includes(h.name.toLowerCase())) {
-                const val = h.value || '';
-                captured[h.name.toLowerCase()] = val.length > 60 ? val.substring(0, 20) + '...' + val.substring(val.length - 10) : val;
-              }
+              const name = h.name.toLowerCase();
+              const val = h.value || '';
+              const stored = SENSITIVE.has(name) && val.length > 60
+                ? val.substring(0, 20) + '...' + val.substring(val.length - 10)
+                : val;
+              requestHeaders[name] = stored;
+              if (AUTH_KEYS.has(name)) auth[name] = stored;
             }
-            if (Object.keys(captured).length > 0) authHeaders = captured;
+            if (Object.keys(auth).length > 0) authHeaders = auth;
+            if (Object.keys(requestHeaders).length === 0) requestHeaders = null;
           }
 
           storePayload(epKey, {
@@ -820,6 +831,8 @@ async function setupListeners() {
             contentType: null,
             requestBody: bodyEntry.body,
             responseBody: null,
+            requestHeaders,
+            responseHeaders: null,
             authHeaders,
             timestamp: bodyEntry.timestamp
           });
@@ -889,28 +902,75 @@ async function getPayloads() {
   return result.payloads || {};
 }
 
+// How many distinct samples to keep per endpoint pattern.
+// Different request bodies (create vs update vs filter variants) get
+// preserved so workflow extraction has the full request shape coverage.
+const MAX_SAMPLES_PER_ENDPOINT = 5;
+const MAX_PAYLOAD_ENTRIES = 1000;
+
+function sampleSignature(data) {
+  // Hash request body shape so we only keep meaningfully different samples.
+  const body = data.requestBody || '';
+  const status = data.status || 0;
+  // Cheap fingerprint: status + body length + first 200 chars
+  return `${status}|${body.length}|${body.substring(0, 200)}`;
+}
+
 async function storePayload(epKey, data) {
   const payloads = await getPayloads();
   const existing = payloads[epKey];
 
-  // Keep the most recent capture, plus preserve history count
-  payloads[epKey] = {
+  const newSample = {
     method: data.method,
     url: data.url,
     status: data.status,
     contentType: data.contentType,
     requestBody: data.requestBody || null,
     responseBody: data.responseBody || null,
+    requestHeaders: data.requestHeaders || null,
+    responseHeaders: data.responseHeaders || null,
     authHeaders: data.authHeaders || null,
-    capturedAt: data.timestamp || Date.now(),
+    capturedAt: data.timestamp || Date.now()
+  };
+
+  // Maintain a samples[] array so multiple distinct request shapes survive.
+  // Top-level fields mirror the latest sample for backward-compat with popup.
+  let samples = existing?.samples ? [...existing.samples] : [];
+  // If a previous entry existed without samples[], seed from its top-level fields.
+  if (existing && samples.length === 0 && (existing.requestBody || existing.responseBody)) {
+    samples.push({
+      method: existing.method,
+      url: existing.url,
+      status: existing.status,
+      contentType: existing.contentType,
+      requestBody: existing.requestBody,
+      responseBody: existing.responseBody,
+      requestHeaders: existing.requestHeaders || null,
+      responseHeaders: existing.responseHeaders || null,
+      authHeaders: existing.authHeaders,
+      capturedAt: existing.capturedAt
+    });
+  }
+
+  const newSig = sampleSignature(newSample);
+  const dupeIdx = samples.findIndex(s => sampleSignature(s) === newSig);
+  if (dupeIdx >= 0) {
+    samples.splice(dupeIdx, 1);
+  }
+  samples.unshift(newSample);
+  if (samples.length > MAX_SAMPLES_PER_ENDPOINT) samples = samples.slice(0, MAX_SAMPLES_PER_ENDPOINT);
+
+  payloads[epKey] = {
+    ...newSample,
+    samples,
     captureCount: (existing?.captureCount || 0) + 1
   };
 
-  // Enforce storage limit: keep max 300 payloads, evict oldest
+  // Enforce storage limit: evict oldest endpoints
   const keys = Object.keys(payloads);
-  if (keys.length > 300) {
+  if (keys.length > MAX_PAYLOAD_ENTRIES) {
     const sorted = keys.sort((a, b) => (payloads[a].capturedAt || 0) - (payloads[b].capturedAt || 0));
-    const toRemove = sorted.slice(0, keys.length - 300);
+    const toRemove = sorted.slice(0, keys.length - MAX_PAYLOAD_ENTRIES);
     toRemove.forEach(k => delete payloads[k]);
   }
 
