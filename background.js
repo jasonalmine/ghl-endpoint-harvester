@@ -902,6 +902,153 @@ async function getPayloads() {
   return result.payloads || {};
 }
 
+// -------------------------------------------------------------------------
+// Workflow recipe extraction
+// -------------------------------------------------------------------------
+
+/**
+ * Pull workflow IDs out of a URL — covers the patterns GHL uses internally:
+ *   /workflows/{id}
+ *   /workflows/v2/locations/{loc}/workflows/{id}
+ *   /workflows/v2/locations/{loc}/workflows/{id}/builder
+ *   ?workflowId={id}  /  ?id={id}
+ * Returns the first ID found, or null.
+ */
+function extractWorkflowId(url) {
+  if (!url) return null;
+  try {
+    const u = new URL(url, 'https://app.gohighlevel.com');
+    // Path-based
+    const m1 = u.pathname.match(/\/workflows\/(?:v\d+\/)?(?:locations\/[^/]+\/workflows\/)?([a-zA-Z0-9]{15,})/);
+    if (m1) return m1[1];
+    // Query-based
+    const wid = u.searchParams.get('workflowId') || u.searchParams.get('id');
+    if (wid && wid.length >= 15) return wid;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Try to pull a workflow ID out of a JSON request/response body — covers
+ * cases where the URL doesn't carry it (e.g. POST .../workflows with body).
+ */
+function extractWorkflowIdFromBody(bodyStr) {
+  if (!bodyStr || typeof bodyStr !== 'string') return null;
+  // Cheap regex search - avoids parsing huge JSON
+  const m = bodyStr.match(/"(?:workflowId|workflow_id|_id|id)"\s*:\s*"([a-zA-Z0-9]{15,})"/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Build per-workflow deploy recipes from captured payloads.
+ *
+ * For each workflow ID found, returns:
+ *   {
+ *     workflowId,
+ *     name (best-effort, parsed from response bodies),
+ *     ops: [{ method, pattern, url, status, requestBody, responseBody, contentType, capturedAt }],
+ *     create: <op or null>,   // POST that created/saved the workflow
+ *     update: <op or null>,   // most recent PUT/PATCH
+ *     read:   <op or null>,   // most recent GET (the canonical workflow shape)
+ *     publish: <op or null>,  // any /publish op
+ *     duplicate: <op or null> // any /duplicate op
+ *   }
+ *
+ * Plus an "_orphans" bucket — interesting workflow-related ops where we
+ * couldn't pin a specific workflow ID (e.g. listings, creates pre-id).
+ */
+async function buildWorkflowRecipes() {
+  const payloads = await getPayloads();
+  const recipes = {};
+  const orphans = [];
+
+  for (const [epKey, p] of Object.entries(payloads)) {
+    const isWorkflowy =
+      /workflow/i.test(epKey) ||
+      /workflow/i.test(p.url || '') ||
+      /workflow/i.test(p.pattern || '');
+
+    if (!isWorkflowy) continue;
+
+    const samples = p.samples && p.samples.length > 0 ? p.samples : [p];
+
+    for (const s of samples) {
+      const wid =
+        extractWorkflowId(s.url) ||
+        extractWorkflowIdFromBody(s.requestBody) ||
+        extractWorkflowIdFromBody(s.responseBody);
+
+      const op = {
+        method: s.method,
+        pattern: epKey.split(' ').slice(1).join(' '),
+        url: s.url,
+        status: s.status,
+        contentType: s.contentType,
+        requestBody: s.requestBody,
+        responseBody: s.responseBody,
+        requestHeaders: s.requestHeaders,
+        responseHeaders: s.responseHeaders,
+        authHeaders: s.authHeaders,
+        capturedAt: s.capturedAt
+      };
+
+      if (!wid) {
+        orphans.push(op);
+        continue;
+      }
+
+      if (!recipes[wid]) {
+        recipes[wid] = {
+          workflowId: wid,
+          name: null,
+          ops: [],
+          create: null,
+          update: null,
+          read: null,
+          publish: null,
+          duplicate: null
+        };
+      }
+      const r = recipes[wid];
+      r.ops.push(op);
+
+      // Best-effort name extraction
+      if (!r.name && s.responseBody) {
+        const m = s.responseBody.match(/"name"\s*:\s*"([^"]{1,120})"/);
+        if (m) r.name = m[1];
+      }
+
+      // Categorize by intent
+      const path = (op.pattern || '').toLowerCase();
+      const method = (op.method || '').toUpperCase();
+      if (/\/publish/.test(path)) r.publish = r.publish || op;
+      else if (/\/duplicate/.test(path)) r.duplicate = r.duplicate || op;
+      else if (method === 'GET') {
+        if (!r.read || (op.capturedAt > (r.read.capturedAt || 0))) r.read = op;
+      } else if (method === 'POST') {
+        if (!r.create || (op.capturedAt > (r.create.capturedAt || 0))) r.create = op;
+      } else if (method === 'PUT' || method === 'PATCH') {
+        if (!r.update || (op.capturedAt > (r.update.capturedAt || 0))) r.update = op;
+      }
+    }
+  }
+
+  // Sort each workflow's ops chronologically
+  for (const r of Object.values(recipes)) {
+    r.ops.sort((a, b) => (a.capturedAt || 0) - (b.capturedAt || 0));
+  }
+
+  return {
+    workflows: recipes,
+    orphans,
+    workflowCount: Object.keys(recipes).length,
+    orphanCount: orphans.length,
+    generatedAt: new Date().toISOString()
+  };
+}
+
 // How many distinct samples to keep per endpoint pattern.
 // Different request bodies (create vs update vs filter variants) get
 // preserved so workflow extraction has the full request shape coverage.
@@ -1197,6 +1344,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.action === 'clearPayloads') {
     chrome.storage.local.set({ payloads: {} }).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+
+  if (msg.action === 'exportWorkflowRecipes') {
+    buildWorkflowRecipes().then(sendResponse);
     return true;
   }
 

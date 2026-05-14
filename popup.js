@@ -1196,6 +1196,59 @@ document.getElementById('exportPayloadsBtn')?.addEventListener('click', async ()
   URL.revokeObjectURL(url);
 });
 
+document.getElementById('exportWorkflowsBtn')?.addEventListener('click', async () => {
+  const btn = document.getElementById('exportWorkflowsBtn');
+  const orig = btn.textContent;
+  btn.textContent = 'Building...';
+  btn.disabled = true;
+  try {
+    const recipes = await chrome.runtime.sendMessage({ action: 'exportWorkflowRecipes' });
+
+    // Try to parse JSON bodies inline so the file is human-readable
+    const enrich = (op) => {
+      if (!op) return op;
+      const out = { ...op };
+      if (out.requestBody) { try { out.requestBody = JSON.parse(out.requestBody); } catch {} }
+      if (out.responseBody) { try { out.responseBody = JSON.parse(out.responseBody); } catch {} }
+      return out;
+    };
+    const enriched = {
+      generatedAt: recipes.generatedAt,
+      workflowCount: recipes.workflowCount,
+      orphanCount: recipes.orphanCount,
+      workflows: {},
+      orphans: (recipes.orphans || []).map(enrich)
+    };
+    for (const [wid, r] of Object.entries(recipes.workflows || {})) {
+      enriched.workflows[wid] = {
+        workflowId: r.workflowId,
+        name: r.name,
+        create: enrich(r.create),
+        update: enrich(r.update),
+        read: enrich(r.read),
+        publish: enrich(r.publish),
+        duplicate: enrich(r.duplicate),
+        ops: r.ops.map(enrich)
+      };
+    }
+
+    const content = JSON.stringify(enriched, null, 2);
+    const blob = new Blob([content], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `ghl-workflow-recipes-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    btn.textContent = `${recipes.workflowCount} workflows`;
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2000);
+  } catch (e) {
+    btn.textContent = 'Failed';
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2000);
+  }
+});
+
 document.getElementById('clearPayloadsBtn')?.addEventListener('click', async () => {
   const btn = document.getElementById('clearPayloadsBtn');
   if (btn.dataset.confirming === 'true') {

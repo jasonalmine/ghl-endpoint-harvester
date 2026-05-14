@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GHL Payload Harvester",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Intercepts every GoHighLevel API call (documented or not) and captures full request + response payloads and headers for workflow reverse-engineering and automated deployment.",
   "permissions": [
     "webRequest",
