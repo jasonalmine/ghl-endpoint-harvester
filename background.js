@@ -1,0 +1,1121 @@
+/**
+ * GHL Endpoint Harvester - Background Service Worker
+ * Intercepts GHL API requests and catalogs normalized endpoint patterns.
+ */
+
+const GHL_DOMAINS = [
+  'services.leadconnectorhq.com',
+  'backend.leadconnectorhq.com',
+  'api.msgsndr.com',
+  'rest.gohighlevel.com',
+  // Firebase domains (GHL uses these under the hood)
+  'firebasestorage.googleapis.com',
+  'firestore.googleapis.com',
+  'identitytoolkit.googleapis.com',
+  'securetoken.googleapis.com'
+];
+
+// Static asset extensions to ignore
+const IGNORED_EXTENSIONS = new Set([
+  '.js', '.mjs', '.css', '.png', '.jpg', '.jpeg', '.gif', '.svg',
+  '.webp', '.ico', '.woff', '.woff2', '.ttf', '.eot', '.otf',
+  '.map', '.json.map', '.ts'
+]);
+
+// HMR / webpack noise patterns
+const IGNORED_PATH_PATTERNS = [
+  /\/__webpack_hmr/,
+  /\/sockjs-node/,
+  /\/hot-update\./,
+  /\/@vite\//,
+  /\/@fs\//,
+  /\/node_modules\//
+];
+
+// Default settings
+const DEFAULT_SETTINGS = {
+  autoCaptureOnStartup: true,
+  maxEndpoints: 500,
+  domains: [...GHL_DOMAINS],
+  exportFormat: 'json'
+};
+
+// -------------------------------------------------------------------------
+// Official GHL API v2 endpoint patterns (for auto-classification)
+// These are the published endpoints at developers.gohighlevel.com
+// Patterns use {param} placeholders and match normalized paths.
+// -------------------------------------------------------------------------
+
+const OFFICIAL_API_PATTERNS = [
+  // Contacts
+  '/contacts/', '/contacts/{contactId}', '/contacts/{contactId}/tasks',
+  '/contacts/{contactId}/tasks/{taskId}', '/contacts/{contactId}/notes',
+  '/contacts/{contactId}/notes/{noteId}', '/contacts/{contactId}/tags',
+  '/contacts/{contactId}/tags/{tagId}', '/contacts/{contactId}/campaigns',
+  '/contacts/{contactId}/campaigns/{campaignId}',
+  '/contacts/{contactId}/workflow', '/contacts/{contactId}/workflow/{workflowId}',
+  '/contacts/{contactId}/appointments', '/contacts/upsert',
+  '/contacts/businessId/{id}', '/contacts/search', '/contacts/search/duplicate',
+  '/contacts/bulk/business/{id}',
+
+  // Opportunities
+  '/opportunities/', '/opportunities/{opportunityId}', '/opportunities/upsert',
+  '/opportunities/search', '/opportunities/{opportunityId}/status',
+  '/opportunities/pipelines', '/opportunities/pipelines/{pipelineId}',
+
+  // Conversations
+  '/conversations/', '/conversations/{conversationId}',
+  '/conversations/{conversationId}/messages', '/conversations/messages',
+  '/conversations/messages/{messageId}', '/conversations/messages/upload',
+  '/conversations/search', '/conversations/messages/{messageId}/schedule',
+  '/conversations/messages/{messageId}/status',
+  '/conversations/messages/inbound',
+  '/conversations/providers/install',
+
+  // Calendars & Events
+  '/calendars/', '/calendars/{calendarId}', '/calendars/events',
+  '/calendars/events/{eventId}', '/calendars/events/appointments',
+  '/calendars/events/appointments/{eventId}', '/calendars/events/block-slots',
+  '/calendars/{calendarId}/free-slots', '/calendars/groups',
+  '/calendars/groups/{groupId}', '/calendars/resources',
+  '/calendars/resources/{resourceId}',
+
+  // Payments & Invoices
+  '/payments/transactions', '/payments/orders/{orderId}',
+  '/payments/orders/{orderId}/fulfillments',
+  '/payments/subscriptions/{subscriptionId}',
+  '/payments/custom-provider/connect', '/payments/custom-provider/disconnect',
+  '/invoices/', '/invoices/{invoiceId}', '/invoices/{invoiceId}/void',
+  '/invoices/{invoiceId}/send', '/invoices/{invoiceId}/record-payment',
+  '/invoices/generate-invoice-number', '/invoices/templates',
+  '/invoices/templates/{templateId}', '/invoices/schedule',
+  '/invoices/schedule/{scheduleId}', '/invoices/text2pay',
+
+  // Products
+  '/products/', '/products/{productId}', '/products/{productId}/price',
+  '/products/{productId}/price/{priceId}',
+  '/products/collections/', '/products/collections/{id}',
+
+  // Campaigns
+  '/campaigns/', '/campaigns/{campaignId}',
+
+  // Workflows
+  '/workflows/', '/workflows/{workflowId}',
+
+  // Users
+  '/users/', '/users/{userId}',
+
+  // Custom Fields & Values
+  '/custom-fields/', '/custom-fields/{fieldId}',
+  '/custom-values/', '/custom-values/{valueId}',
+  '/locations/{locationId}/customFields',
+  '/locations/{locationId}/customValues',
+
+  // Locations
+  '/locations/', '/locations/{locationId}', '/locations/search',
+  '/locations/{locationId}/tags', '/locations/{locationId}/tags/{tagId}',
+  '/locations/{locationId}/tasks/search',
+  '/locations/{locationId}/timezone',
+  '/locations/{locationId}/templates',
+
+  // Companies
+  '/companies/', '/companies/{companyId}',
+
+  // Forms & Surveys
+  '/forms/', '/forms/{formId}', '/forms/submissions',
+  '/forms/upload-custom-files',
+  '/surveys/', '/surveys/{surveyId}', '/surveys/submissions',
+
+  // Blogs
+  '/blogs/', '/blogs/{blogId}', '/blogs/authors', '/blogs/categories',
+  '/blogs/{blogId}/posts', '/blogs/{blogId}/posts/{postId}',
+  '/blogs/check-slug',
+
+  // Social Media Posting (official v2)
+  '/social-media-posting/', '/social-media-posting/{id}/posts',
+  '/social-media-posting/{id}/posts/{postId}',
+  '/social-media-posting/{id}/accounts',
+  '/social-media-posting/statistics',
+  '/social-media-posting/oauth/{platform}/start',
+
+  // Notes
+  '/notes/', '/notes/{noteId}',
+
+  // Tags
+  '/tags/', '/tags/{tagId}',
+
+  // Tasks
+  '/tasks/', '/tasks/{taskId}', '/tasks/search',
+
+  // Funnels (official - very limited)
+  '/funnels/', '/funnels/{funnelId}',
+  '/funnels/page', '/funnels/page/{pageId}',
+  '/funnels/lookup/redirect', '/funnels/lookup/redirect/{redirectId}',
+
+  // Businesses
+  '/businesses/', '/businesses/{id}',
+
+  // Triggers
+  '/triggers/', '/triggers/{triggerId}',
+
+  // Webhooks
+  '/webhooks/', '/webhooks/{webhookId}',
+
+  // OAuth
+  '/oauth/token', '/oauth/locationToken',
+  '/oauth/installedLocations',
+
+  // Media / Files
+  '/medias/', '/medias/{mediaId}',
+  '/medias/upload-file', '/medias/files',
+
+  // SaaS
+  '/saas-api/public-api/bulk-disable-saas/',
+  '/saas-api/public-api/enable-saas/',
+  '/saas-api/public-api/update-rebilling/',
+
+  // Associations
+  '/associations/',
+
+  // Courses / Memberships
+  '/courses/', '/courses/{courseId}',
+
+  // Email Verification
+  '/emails/verify',
+
+  // Snapshots
+  '/snapshots/', '/snapshots/{snapshotId}',
+  '/snapshots/share/link',
+];
+
+/**
+ * Classify an endpoint as 'official' or 'undocumented' by matching
+ * against known published API v2 patterns.
+ *
+ * Matching strategy:
+ * - Normalize both the captured pattern and official patterns for comparison
+ * - Replace all {xxxId} and {id} etc. with a generic placeholder for matching
+ * - Strip trailing slashes for comparison
+ * - OPTIONS requests inherit the classification of their corresponding method
+ */
+function classifyEndpoint(method, normalizedPattern) {
+  // OPTIONS are just CORS preflight, always classify as 'preflight'
+  if (method === 'OPTIONS') return 'preflight';
+
+  // Normalize for matching: replace all {xxxxx} with {_} and strip trailing /
+  const normalize = (p) => p.replace(/\{[^}]+\}/g, '{_}').replace(/\/+$/, '').toLowerCase();
+  const captured = normalize(normalizedPattern);
+
+  for (const official of OFFICIAL_API_PATTERNS) {
+    if (normalize(official) === captured) return 'official';
+  }
+
+  return 'undocumented';
+}
+
+// -------------------------------------------------------------------------
+// Path normalization
+// -------------------------------------------------------------------------
+
+/**
+ * Normalize a URL path by replacing dynamic ID segments with typed placeholders.
+ * Order matters: more specific patterns first.
+ */
+function normalizePath(pathname) {
+  const segments = pathname.split('/').map(seg => {
+    if (!seg) return seg;
+
+    // UUID (8-4-4-4-12 hex)
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg)) {
+      return '{uuid}';
+    }
+
+    // MongoDB ObjectId (exactly 24 hex chars)
+    if (/^[0-9a-f]{24}$/i.test(seg)) {
+      return '{objectId}';
+    }
+
+    // Pure numeric ID
+    if (/^\d{4,}$/.test(seg)) {
+      return '{numId}';
+    }
+
+    // GHL-style alphanumeric IDs (15+ chars, mixed case/numbers, no hyphens)
+    // These are the typical GHL location/contact/opportunity IDs
+    if (/^[a-zA-Z0-9]{15,}$/.test(seg)) {
+      return '{id}';
+    }
+
+    // Alphanumeric with hyphens/underscores, 10+ chars (likely a generated ID)
+    if (/^[a-zA-Z0-9_-]{10,}$/.test(seg) && /[0-9]/.test(seg) && /[a-zA-Z]/.test(seg)) {
+      return '{id}';
+    }
+
+    return seg;
+  });
+
+  // Second pass: apply semantic names based on position after known path words
+  const result = [];
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const prev = segments[i - 1] || '';
+
+    if (seg === '{id}') {
+      // Apply semantic naming based on preceding path word
+      switch (prev) {
+        case 'locations':      result.push('{locationId}'); break;
+        case 'contacts':       result.push('{contactId}'); break;
+        case 'opportunities':  result.push('{opportunityId}'); break;
+        case 'conversations':  result.push('{conversationId}'); break;
+        case 'messages':       result.push('{messageId}'); break;
+        case 'campaigns':      result.push('{campaignId}'); break;
+        case 'workflows':      result.push('{workflowId}'); break;
+        case 'pipelines':      result.push('{pipelineId}'); break;
+        case 'stages':         result.push('{stageId}'); break;
+        case 'calendars':      result.push('{calendarId}'); break;
+        case 'appointments':   result.push('{appointmentId}'); break;
+        case 'funnels':        result.push('{funnelId}'); break;
+        case 'pages':          result.push('{pageId}'); break;
+        case 'forms':          result.push('{formId}'); break;
+        case 'surveys':        result.push('{surveyId}'); break;
+        case 'users':          result.push('{userId}'); break;
+        case 'teams':          result.push('{teamId}'); break;
+        case 'tags':           result.push('{tagId}'); break;
+        case 'tasks':          result.push('{taskId}'); break;
+        case 'notes':          result.push('{noteId}'); break;
+        case 'products':       result.push('{productId}'); break;
+        case 'invoices':       result.push('{invoiceId}'); break;
+        case 'payments':       result.push('{paymentId}'); break;
+        case 'subscriptions':  result.push('{subscriptionId}'); break;
+        case 'memberships':    result.push('{membershipId}'); break;
+        case 'courses':        result.push('{courseId}'); break;
+        case 'emails':         result.push('{emailId}'); break;
+        case 'templates':      result.push('{templateId}'); break;
+        case 'companies':      result.push('{companyId}'); break;
+        case 'agencies':       result.push('{agencyId}'); break;
+        case 'media':          result.push('{mediaId}'); break;
+        case 'blogs':          result.push('{blogId}'); break;
+        case 'posts':          result.push('{postId}'); break;
+        case 'categories':     result.push('{categoryId}'); break;
+        case 'triggers':       result.push('{triggerId}'); break;
+        case 'automations':    result.push('{automationId}'); break;
+        case 'snapshots':      result.push('{snapshotId}'); break;
+        case 'funnelsteps':    result.push('{stepId}'); break;
+        case 'customfields':   result.push('{fieldId}'); break;
+        case 'attributes':     result.push('{attributeId}'); break;
+        default:               result.push('{id}'); break;
+      }
+    } else {
+      result.push(seg);
+    }
+  }
+
+  return result.join('/');
+}
+
+// -------------------------------------------------------------------------
+// Static asset / noise filtering
+// -------------------------------------------------------------------------
+
+function shouldIgnore(url) {
+  try {
+    const u = new URL(url);
+    const path = u.pathname.toLowerCase();
+
+    // Check extension
+    for (const ext of IGNORED_EXTENSIONS) {
+      if (path.endsWith(ext)) return true;
+    }
+
+    // Check HMR/webpack patterns
+    for (const pat of IGNORED_PATH_PATTERNS) {
+      if (pat.test(u.pathname)) return true;
+    }
+
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+function isGHLDomain(url, activeDomains) {
+  try {
+    const hostname = new URL(url).hostname;
+    return activeDomains.some(d => hostname === d || hostname.endsWith('.' + d));
+  } catch {
+    return false;
+  }
+}
+
+// -------------------------------------------------------------------------
+// Auth type detection
+// -------------------------------------------------------------------------
+
+function detectAuthType(headers) {
+  if (!headers) return 'none';
+  let hasTokenId = false;
+  for (const h of headers) {
+    const name = h.name.toLowerCase();
+    const val = h.value || '';
+    if (name === 'authorization') {
+      if (val.startsWith('Bearer ')) return 'bearer';
+      if (val.startsWith('Basic ')) return 'basic';
+      return 'other';
+    }
+    if (name === 'x-api-key' || name === 'api-key') return 'apikey';
+    if (name === 'token-id') hasTokenId = true;
+  }
+  // token-id header without Authorization = Firebase JWT auth
+  if (hasTokenId) return 'firebase-jwt';
+  return 'none';
+}
+
+// -------------------------------------------------------------------------
+// Storage helpers
+// -------------------------------------------------------------------------
+
+async function getEndpoints() {
+  const result = await chrome.storage.local.get('endpoints');
+  return result.endpoints || {};
+}
+
+async function getCaptureState() {
+  const result = await chrome.storage.local.get('captureState');
+  return result.captureState || {
+    isCapturing: true,
+    startedAt: Date.now(),
+    totalRequests: 0
+  };
+}
+
+async function getSettings() {
+  const result = await chrome.storage.local.get('settings');
+  return { ...DEFAULT_SETTINGS, ...(result.settings || {}) };
+}
+
+// -------------------------------------------------------------------------
+// Vault config + delivery
+// -------------------------------------------------------------------------
+
+async function getVaultConfig() {
+  const result = await chrome.storage.local.get('vaultConfig');
+  return result.vaultConfig || {
+    vaultUrl: '',
+    vaultSecret: '',
+    autoPush: false,
+    lastPushAt: null,
+    lastPushStatus: null,
+    pushCount: 0
+  };
+}
+
+async function pushPayloadToVault(epKey, payloadData) {
+  try {
+    const vc = await getVaultConfig();
+    if (!vc.vaultUrl) return;
+
+    const endpoints = await getEndpoints();
+    const ep = endpoints[epKey] || {};
+
+    const body = {
+      type: 'payload',
+      epKey,
+      endpoint: {
+        method: ep.method || epKey.split(' ')[0],
+        pattern: ep.pattern || epKey.split(' ').slice(1).join(' '),
+        domain: ep.domain || null,
+        hitCount: ep.hitCount || 1,
+        firstSeen: ep.firstSeen || null,
+        lastSeen: ep.lastSeen || null,
+        queryParams: ep.queryParams || [],
+        statusCodes: ep.statusCodes || [],
+        authType: ep.authType || 'none',
+        apiStatus: ep.apiStatus || 'undocumented'
+      },
+      payload: {
+        method: payloadData.method || null,
+        url: payloadData.url || null,
+        status: payloadData.status || null,
+        contentType: payloadData.contentType || null,
+        requestBody: payloadData.requestBody || null,
+        responseBody: payloadData.responseBody || null,
+        authHeaders: payloadData.authHeaders || null,
+        capturedAt: payloadData.capturedAt || Date.now()
+      },
+      source: 'ghl-endpoint-harvester',
+      pushedAt: new Date().toISOString()
+    };
+
+    const resp = await fetch(vc.vaultUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(vc.vaultSecret ? { 'X-Secret': vc.vaultSecret } : {})
+      },
+      body: JSON.stringify(body)
+    });
+
+    vc.lastPushAt = Date.now();
+    vc.lastPushStatus = resp.ok ? 'ok' : 'error';
+    vc.pushCount = (vc.pushCount || 0) + 1;
+    await chrome.storage.local.set({ vaultConfig: vc });
+  } catch {
+    try {
+      const vc = await getVaultConfig();
+      vc.lastPushStatus = 'error';
+      vc.lastPushAt = Date.now();
+      await chrome.storage.local.set({ vaultConfig: vc });
+    } catch {}
+  }
+}
+
+async function pushBulkToVault() {
+  const vc = await getVaultConfig();
+  if (!vc.vaultUrl) throw new Error('Vault URL not configured');
+
+  const [endpoints, payloads] = await Promise.all([getEndpoints(), getPayloads()]);
+  const bulkUrl = vc.vaultUrl.replace(/\/api\/ingest$/, '/api/ingest/bulk');
+
+  const resp = await fetch(bulkUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(vc.vaultSecret ? { 'X-Secret': vc.vaultSecret } : {})
+    },
+    body: JSON.stringify({
+      type: 'bulk',
+      endpoints,
+      payloads,
+      source: 'ghl-endpoint-harvester',
+      pushedAt: new Date().toISOString()
+    })
+  });
+
+  vc.lastPushAt = Date.now();
+  vc.lastPushStatus = resp.ok ? 'ok' : 'error';
+  vc.pushCount = (vc.pushCount || 0) + 1;
+  await chrome.storage.local.set({ vaultConfig: vc });
+
+  if (!resp.ok) throw new Error(`Vault returned ${resp.status}`);
+  return await resp.json();
+}
+
+// -------------------------------------------------------------------------
+// Badge
+// -------------------------------------------------------------------------
+
+async function updateBadge() {
+  try {
+    const endpoints = await getEndpoints();
+    const count = Object.keys(endpoints).length;
+    const text = count > 0 ? (count > 999 ? '999+' : String(count)) : '';
+    chrome.action.setBadgeText({ text });
+    chrome.action.setBadgeBackgroundColor({ color: '#16a34a' });
+  } catch (e) {
+    console.warn('GHL Endpoint Harvester: badge update failed', e.message);
+  }
+}
+
+// -------------------------------------------------------------------------
+// Query param extraction
+// -------------------------------------------------------------------------
+
+function extractQueryParams(url) {
+  try {
+    const u = new URL(url);
+    const params = [];
+    for (const key of u.searchParams.keys()) {
+      if (!params.includes(key)) params.push(key);
+    }
+    return params;
+  } catch {
+    return [];
+  }
+}
+
+// -------------------------------------------------------------------------
+// Core endpoint recording
+// -------------------------------------------------------------------------
+
+// In-memory write buffer to batch storage writes
+let writeBuffer = {};
+let writeTimer = null;
+
+function scheduleFlush() {
+  if (writeTimer) return;
+  writeTimer = setTimeout(flushBuffer, 500);
+}
+
+async function flushBuffer() {
+  writeTimer = null;
+  if (Object.keys(writeBuffer).length === 0) return;
+
+  const toFlush = writeBuffer;
+  writeBuffer = {};
+
+  const [endpoints, captureState, settings] = await Promise.all([
+    getEndpoints(),
+    getCaptureState(),
+    getSettings()
+  ]);
+
+  let changed = false;
+
+  for (const [epKey, update] of Object.entries(toFlush)) {
+    const existing = endpoints[epKey];
+
+    if (existing) {
+      // Merge into existing
+      existing.hitCount = (existing.hitCount || 1) + update.hitCount;
+      existing.lastSeen = update.lastSeen;
+
+      // Merge query params
+      for (const p of update.queryParams) {
+        if (!existing.queryParams.includes(p)) existing.queryParams.push(p);
+      }
+
+      // Merge status codes
+      for (const sc of update.statusCodes) {
+        if (!existing.statusCodes.includes(sc)) existing.statusCodes.push(sc);
+      }
+
+      // Keep last 3 sample URLs, deduped
+      for (const su of update.sampleUrls) {
+        if (!existing.sampleUrls.includes(su)) {
+          existing.sampleUrls.unshift(su);
+          if (existing.sampleUrls.length > 3) existing.sampleUrls.pop();
+        }
+      }
+
+      // Auth type: prefer bearer > apikey > other > none
+      if (update.authType === 'bearer') existing.authType = 'bearer';
+      else if (update.authType === 'apikey' && existing.authType === 'none') existing.authType = 'apikey';
+
+    } else {
+      // Enforce max endpoints limit
+      const currentCount = Object.keys(endpoints).length;
+      if (currentCount >= (settings.maxEndpoints || 500)) continue;
+
+      endpoints[epKey] = {
+        method: update.method,
+        pattern: update.pattern,
+        domain: update.domain,
+        hitCount: update.hitCount,
+        firstSeen: update.firstSeen,
+        lastSeen: update.lastSeen,
+        sampleUrls: update.sampleUrls,
+        queryParams: update.queryParams,
+        statusCodes: update.statusCodes,
+        authType: update.authType,
+        apiStatus: classifyEndpoint(update.method, update.pattern),
+        tags: [],
+        notes: '',
+        starred: false
+      };
+    }
+
+    changed = true;
+  }
+
+  // Increment total requests
+  captureState.totalRequests = (captureState.totalRequests || 0) + Object.values(toFlush).reduce((sum, u) => sum + u.hitCount, 0);
+
+  if (changed) {
+    await chrome.storage.local.set({ endpoints, captureState });
+    updateBadge();
+  } else {
+    await chrome.storage.local.set({ captureState });
+  }
+}
+
+function recordEndpoint({ method, url, headers, statusCode }) {
+  if (shouldIgnore(url)) return;
+
+  try {
+    const u = new URL(url);
+    const normalizedPath = normalizePath(u.pathname);
+    const epKey = `${method} ${normalizedPath}`;
+    const now = Date.now();
+    const queryParams = extractQueryParams(url);
+    const authType = detectAuthType(headers);
+    const domain = u.hostname;
+
+    if (writeBuffer[epKey]) {
+      // Accumulate in buffer
+      writeBuffer[epKey].hitCount++;
+      writeBuffer[epKey].lastSeen = now;
+      for (const p of queryParams) {
+        if (!writeBuffer[epKey].queryParams.includes(p)) writeBuffer[epKey].queryParams.push(p);
+      }
+      if (statusCode && !writeBuffer[epKey].statusCodes.includes(statusCode)) {
+        writeBuffer[epKey].statusCodes.push(statusCode);
+      }
+      if (!writeBuffer[epKey].sampleUrls.includes(url)) {
+        writeBuffer[epKey].sampleUrls.unshift(url);
+        if (writeBuffer[epKey].sampleUrls.length > 3) writeBuffer[epKey].sampleUrls.pop();
+      }
+      if (authType === 'bearer') writeBuffer[epKey].authType = 'bearer';
+    } else {
+      writeBuffer[epKey] = {
+        method,
+        pattern: normalizedPath,
+        domain,
+        hitCount: 1,
+        firstSeen: now,
+        lastSeen: now,
+        sampleUrls: [url],
+        queryParams,
+        statusCodes: statusCode ? [statusCode] : [],
+        authType
+      };
+    }
+
+    scheduleFlush();
+  } catch (e) {
+    console.warn('GHL Endpoint Harvester: recordEndpoint error', e.message);
+  }
+}
+
+// -------------------------------------------------------------------------
+// In-flight request tracking (to correlate headers with status codes)
+// -------------------------------------------------------------------------
+
+// requestId -> { method, url, headers }
+const inFlight = new Map();
+
+// requestId -> { body, url, method, timestamp } - captured by onBeforeRequest
+const requestBodies = new Map();
+
+// -------------------------------------------------------------------------
+// webRequest listeners
+// -------------------------------------------------------------------------
+
+async function setupListeners() {
+  const settings = await getSettings();
+  const captureState = await getCaptureState();
+
+  // Build URL patterns from active domains
+  const urlPatterns = settings.domains.flatMap(d => [
+    `*://${d}/*`
+  ]);
+
+  // Capture request bodies for POST/PUT/PATCH/DELETE via webRequest (reliable fallback)
+  chrome.webRequest.onBeforeRequest.addListener(
+    (details) => {
+      if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(details.method)) return;
+      if (shouldIgnore(details.url)) return;
+
+      let body = null;
+      if (details.requestBody?.raw) {
+        try {
+          const parts = details.requestBody.raw
+            .filter(r => r.bytes)
+            .map(r => new Uint8Array(r.bytes));
+          if (parts.length > 0) {
+            const total = parts.reduce((sum, p) => sum + p.length, 0);
+            const combined = new Uint8Array(total);
+            let offset = 0;
+            for (const p of parts) { combined.set(p, offset); offset += p.length; }
+            body = new TextDecoder().decode(combined);
+            // Truncate large bodies
+            if (body.length > 102400) body = body.substring(0, 102400) + '...[TRUNCATED]';
+          }
+        } catch {}
+      } else if (details.requestBody?.formData) {
+        try { body = JSON.stringify(details.requestBody.formData); } catch {}
+      }
+
+      if (body) {
+        requestBodies.set(details.requestId, {
+          body,
+          url: details.url,
+          method: details.method,
+          timestamp: Date.now()
+        });
+        // Evict old entries
+        if (requestBodies.size > 1000) {
+          const oldest = requestBodies.keys().next().value;
+          requestBodies.delete(oldest);
+        }
+      }
+    },
+    { urls: urlPatterns },
+    ['requestBody']
+  );
+
+  // Capture request headers (method + auth type)
+  chrome.webRequest.onBeforeSendHeaders.addListener(
+    async (details) => {
+      // Check live capture state
+      const state = await getCaptureState();
+      if (!state.isCapturing) return;
+
+      if (shouldIgnore(details.url)) return;
+
+      // Store in-flight info for correlation with response
+      inFlight.set(details.requestId, {
+        method: details.method,
+        url: details.url,
+        headers: details.requestHeaders || []
+      });
+
+      // Clean up stale entries (older than 30s via size cap)
+      if (inFlight.size > 2000) {
+        const firstKey = inFlight.keys().next().value;
+        inFlight.delete(firstKey);
+      }
+    },
+    { urls: urlPatterns },
+    ['requestHeaders', 'extraHeaders']
+  );
+
+  // Capture response status
+  chrome.webRequest.onCompleted.addListener(
+    async (details) => {
+      const state = await getCaptureState();
+      if (!state.isCapturing) return;
+
+      if (shouldIgnore(details.url)) return;
+
+      const inFlightEntry = inFlight.get(details.requestId);
+      inFlight.delete(details.requestId);
+
+      const method = inFlightEntry?.method || details.method || 'GET';
+      const headers = inFlightEntry?.headers || [];
+
+      recordEndpoint({
+        method,
+        url: details.url,
+        headers,
+        statusCode: details.statusCode || null
+      });
+
+      // If we captured a request body via onBeforeRequest, store as payload
+      const bodyEntry = requestBodies.get(details.requestId);
+      if (bodyEntry) {
+        requestBodies.delete(details.requestId);
+        try {
+          const u = new URL(details.url);
+          const normalizedPath = normalizePath(u.pathname);
+          const epKey = `${method} ${normalizedPath}`;
+
+          // Extract auth headers from in-flight data
+          let authHeaders = null;
+          if (headers && headers.length > 0) {
+            const AUTH_NAMES = ['authorization', 'token-id', 'channel', 'source', 'version', 'x-api-key'];
+            const captured = {};
+            for (const h of headers) {
+              if (AUTH_NAMES.includes(h.name.toLowerCase())) {
+                const val = h.value || '';
+                captured[h.name.toLowerCase()] = val.length > 60 ? val.substring(0, 20) + '...' + val.substring(val.length - 10) : val;
+              }
+            }
+            if (Object.keys(captured).length > 0) authHeaders = captured;
+          }
+
+          storePayload(epKey, {
+            method,
+            url: details.url,
+            status: details.statusCode || null,
+            contentType: null,
+            requestBody: bodyEntry.body,
+            responseBody: null,
+            authHeaders,
+            timestamp: bodyEntry.timestamp
+          });
+        } catch {}
+      }
+    },
+    { urls: urlPatterns }
+  );
+
+  // Also handle errors (still want to log the endpoint attempt)
+  chrome.webRequest.onErrorOccurred.addListener(
+    async (details) => {
+      const state = await getCaptureState();
+      if (!state.isCapturing) return;
+
+      if (shouldIgnore(details.url)) return;
+
+      const inFlightEntry = inFlight.get(details.requestId);
+      inFlight.delete(details.requestId);
+
+      const method = inFlightEntry?.method || details.method || 'GET';
+      const headers = inFlightEntry?.headers || [];
+
+      // Record with no status code (error)
+      recordEndpoint({ method, url: details.url, headers, statusCode: null });
+    },
+    { urls: urlPatterns }
+  );
+}
+
+// -------------------------------------------------------------------------
+// Initialization
+// -------------------------------------------------------------------------
+
+async function init() {
+  const settings = await getSettings();
+  const stored = await chrome.storage.local.get('captureState');
+
+  // Initialize capture state
+  if (!stored.captureState) {
+    const autoCapture = settings.autoCaptureOnStartup !== false;
+    await chrome.storage.local.set({
+      captureState: {
+        isCapturing: autoCapture,
+        startedAt: Date.now(),
+        totalRequests: 0
+      }
+    });
+  }
+
+  await setupListeners();
+  updateBadge();
+}
+
+init();
+
+// -------------------------------------------------------------------------
+// Message handler for popup
+// -------------------------------------------------------------------------
+
+// -------------------------------------------------------------------------
+// Payload storage (response/request bodies)
+// -------------------------------------------------------------------------
+
+async function getPayloads() {
+  const result = await chrome.storage.local.get('payloads');
+  return result.payloads || {};
+}
+
+async function storePayload(epKey, data) {
+  const payloads = await getPayloads();
+  const existing = payloads[epKey];
+
+  // Keep the most recent capture, plus preserve history count
+  payloads[epKey] = {
+    method: data.method,
+    url: data.url,
+    status: data.status,
+    contentType: data.contentType,
+    requestBody: data.requestBody || null,
+    responseBody: data.responseBody || null,
+    authHeaders: data.authHeaders || null,
+    capturedAt: data.timestamp || Date.now(),
+    captureCount: (existing?.captureCount || 0) + 1
+  };
+
+  // Enforce storage limit: keep max 300 payloads, evict oldest
+  const keys = Object.keys(payloads);
+  if (keys.length > 300) {
+    const sorted = keys.sort((a, b) => (payloads[a].capturedAt || 0) - (payloads[b].capturedAt || 0));
+    const toRemove = sorted.slice(0, keys.length - 300);
+    toRemove.forEach(k => delete payloads[k]);
+  }
+
+  await chrome.storage.local.set({ payloads });
+
+  // Auto-push to vault if configured
+  const vc = await getVaultConfig();
+  if (vc.autoPush && vc.vaultUrl) {
+    pushPayloadToVault(epKey, payloads[epKey]);
+  }
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+
+  // Handle body captures from the interceptor (via bridge.js)
+  // This supplements the webRequest body capture with response bodies
+  if (msg.action === 'captureBody') {
+    const data = msg.data;
+    if (!data || !data.url) return;
+    try {
+      const u = new URL(data.url);
+      const normalizedPath = normalizePath(u.pathname);
+      const epKey = `${data.method} ${normalizedPath}`;
+
+      // Merge with existing payload if webRequest already captured request body
+      getPayloads().then(payloads => {
+        const existing = payloads[epKey];
+        if (existing && existing.requestBody && !data.requestBody) {
+          // Keep the webRequest's request body, add the interceptor's response body
+          data.requestBody = existing.requestBody;
+        }
+        storePayload(epKey, data);
+      });
+    } catch (e) {
+      console.warn('GHL Endpoint Harvester: captureBody error', e.message);
+    }
+    return;
+  }
+
+  if (msg.action === 'getEndpoints') {
+    getEndpoints().then(sendResponse);
+    return true;
+  }
+
+  if (msg.action === 'getCaptureState') {
+    getCaptureState().then(sendResponse);
+    return true;
+  }
+
+  if (msg.action === 'toggleCapture') {
+    getCaptureState().then(async (state) => {
+      state.isCapturing = !state.isCapturing;
+      if (state.isCapturing) {
+        state.startedAt = Date.now();
+        state.totalRequests = 0;
+      }
+      await chrome.storage.local.set({ captureState: state });
+      sendResponse(state);
+    });
+    return true;
+  }
+
+  if (msg.action === 'starEndpoint') {
+    getEndpoints().then(async (endpoints) => {
+      if (endpoints[msg.key]) {
+        endpoints[msg.key].starred = !endpoints[msg.key].starred;
+        await chrome.storage.local.set({ endpoints });
+      }
+      sendResponse({ ok: true });
+    });
+    return true;
+  }
+
+  if (msg.action === 'noteEndpoint') {
+    getEndpoints().then(async (endpoints) => {
+      if (endpoints[msg.key]) {
+        endpoints[msg.key].notes = msg.notes || '';
+        await chrome.storage.local.set({ endpoints });
+      }
+      sendResponse({ ok: true });
+    });
+    return true;
+  }
+
+  if (msg.action === 'tagEndpoint') {
+    getEndpoints().then(async (endpoints) => {
+      if (endpoints[msg.key]) {
+        const ep = endpoints[msg.key];
+        if (msg.add && !ep.tags.includes(msg.add)) {
+          ep.tags.push(msg.add);
+        }
+        if (msg.remove) {
+          ep.tags = ep.tags.filter(t => t !== msg.remove);
+        }
+        await chrome.storage.local.set({ endpoints });
+      }
+      sendResponse({ ok: true });
+    });
+    return true;
+  }
+
+  if (msg.action === 'deleteEndpoint') {
+    getEndpoints().then(async (endpoints) => {
+      delete endpoints[msg.key];
+      await chrome.storage.local.set({ endpoints });
+      updateBadge();
+      sendResponse({ ok: true });
+    });
+    return true;
+  }
+
+  if (msg.action === 'clearAll') {
+    chrome.storage.local.set({
+      endpoints: {},
+      captureState: {
+        isCapturing: true,
+        startedAt: Date.now(),
+        totalRequests: 0
+      }
+    }).then(() => {
+      updateBadge();
+      sendResponse({ ok: true });
+    });
+    return true;
+  }
+
+  if (msg.action === 'reclassifyAll') {
+    getEndpoints().then(async (endpoints) => {
+      let changed = 0;
+      for (const [key, ep] of Object.entries(endpoints)) {
+        const newStatus = classifyEndpoint(ep.method, ep.pattern);
+        if (ep.apiStatus !== newStatus) {
+          ep.apiStatus = newStatus;
+          changed++;
+        }
+      }
+      if (changed > 0) await chrome.storage.local.set({ endpoints });
+      sendResponse({ ok: true, changed });
+    });
+    return true;
+  }
+
+  if (msg.action === 'exportEndpoints') {
+    Promise.all([getEndpoints(), getSettings()]).then(([endpoints, settings]) => {
+      sendResponse({ endpoints, format: msg.format || settings.exportFormat || 'json' });
+    });
+    return true;
+  }
+
+  if (msg.action === 'getPayloads') {
+    getPayloads().then(sendResponse);
+    return true;
+  }
+
+  if (msg.action === 'getPayload') {
+    getPayloads().then(payloads => {
+      sendResponse(payloads[msg.key] || null);
+    });
+    return true;
+  }
+
+  if (msg.action === 'clearPayloads') {
+    chrome.storage.local.set({ payloads: {} }).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+
+  if (msg.action === 'getSettings') {
+    getSettings().then(sendResponse);
+    return true;
+  }
+
+  if (msg.action === 'setSettings') {
+    chrome.storage.local.set({ settings: msg.settings }).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+
+  if (msg.action === 'getVaultConfig') {
+    getVaultConfig().then(sendResponse);
+    return true;
+  }
+
+  if (msg.action === 'setVaultConfig') {
+    chrome.storage.local.set({ vaultConfig: msg.config }).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+
+  if (msg.action === 'pushToVault') {
+    pushBulkToVault()
+      .then(result => sendResponse({ ok: true, ...result }))
+      .catch(err => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+
+  if (msg.action === 'pushSingleToVault') {
+    pushPayloadToVault(msg.epKey, msg.payload)
+      .then(() => sendResponse({ ok: true }))
+      .catch(err => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+});
+
+// Periodic cleanup alarm: flush any remaining buffer
+chrome.alarms.create('bufferFlush', { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'bufferFlush') {
+    if (Object.keys(writeBuffer).length > 0) flushBuffer();
+  }
+});

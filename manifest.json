@@ -1,0 +1,59 @@
+{
+  "manifest_version": 3,
+  "name": "GHL Endpoint Harvester",
+  "version": "1.3.0",
+  "description": "Intercepts and catalogs undocumented GHL API endpoints as you navigate GoHighLevel, with request + response body capture.",
+  "permissions": [
+    "webRequest",
+    "storage",
+    "scripting",
+    "alarms"
+  ],
+  "host_permissions": [
+    "*://*.leadconnectorhq.com/*",
+    "*://*.gohighlevel.com/*",
+    "*://*.msgsndr.com/*",
+    "*://*.firebasestorage.googleapis.com/*",
+    "*://*.firestore.googleapis.com/*",
+    "*://identitytoolkit.googleapis.com/*",
+    "*://securetoken.googleapis.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.gohighlevel.com/*",
+        "*://*.leadconnectorhq.com/*",
+        "*://*.msgsndr.com/*"
+      ],
+      "js": ["interceptor.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://*.gohighlevel.com/*",
+        "*://*.leadconnectorhq.com/*",
+        "*://*.msgsndr.com/*"
+      ],
+      "js": ["bridge.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "GHL Endpoint Harvester",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
