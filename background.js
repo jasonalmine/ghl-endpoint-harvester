@@ -397,14 +397,18 @@ async function getSettings() {
 // Vault config + delivery
 // -------------------------------------------------------------------------
 
+// Hard-coded local vault. The extension always reads from / writes to this
+// single place — no per-profile URL configuration. Run the vault with:
+//   node vault-server/server.js   (or vault-server/install-macos.sh)
+const LOCAL_VAULT_URL = 'http://127.0.0.1:7777/api/ingest';
+
 async function getVaultConfig() {
   const result = await chrome.storage.local.get('vaultConfig');
+  const stored = result.vaultConfig || {};
   return {
-    vaultUrl: '',
-    vaultSecret: '',
-    autoPush: false,
-    autoSync: false,
-    syncIntervalMinutes: 5,
+    autoPush: true,
+    autoSync: true,
+    syncIntervalMinutes: 2,
     lastPushAt: null,
     lastPushStatus: null,
     pushCount: 0,
@@ -412,7 +416,10 @@ async function getVaultConfig() {
     lastPullStatus: null,
     pullCount: 0,
     lastSyncAt: null,
-    ...(result.vaultConfig || {})
+    ...stored,
+    // These are NOT configurable — always forced to the local vault.
+    vaultUrl: LOCAL_VAULT_URL,
+    vaultSecret: ''
   };
 }
 
@@ -1504,7 +1511,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.action === 'setVaultConfig') {
-    chrome.storage.local.set({ vaultConfig: msg.config }).then(async () => {
+    // Only persist the toggles/counters — URL & secret are hard-coded.
+    const incoming = msg.config || {};
+    const clean = {
+      autoPush: incoming.autoPush !== false,
+      autoSync: incoming.autoSync !== false,
+      syncIntervalMinutes: Math.max(1, Math.min(60, Number(incoming.syncIntervalMinutes) || 2)),
+      lastPushAt: incoming.lastPushAt || null,
+      lastPushStatus: incoming.lastPushStatus || null,
+      pushCount: incoming.pushCount || 0,
+      lastPullAt: incoming.lastPullAt || null,
+      lastPullStatus: incoming.lastPullStatus || null,
+      pullCount: incoming.pullCount || 0,
+      lastSyncAt: incoming.lastSyncAt || null
+    };
+    chrome.storage.local.set({ vaultConfig: clean }).then(async () => {
       await rescheduleSyncAlarm();
       sendResponse({ ok: true });
     });
@@ -1580,3 +1601,9 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
 // Initialize the sync alarm on startup
 rescheduleSyncAlarm().catch(() => {});
+
+// Pull from the vault shortly after the service worker starts so this
+// profile reflects the shared vault without waiting for the first alarm.
+setTimeout(() => {
+  pullFromVault().catch(() => { /* vault may be offline; harmless */ });
+}, 3000);

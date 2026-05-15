@@ -688,17 +688,14 @@ async function loadSettings() {
 
 async function loadVaultConfig() {
   vaultConfig = await chrome.runtime.sendMessage({ action: 'getVaultConfig' });
-  document.getElementById('vaultAutoPush').checked = vaultConfig.autoPush || false;
   const autoSyncEl = document.getElementById('vaultAutoSync');
-  if (autoSyncEl) autoSyncEl.checked = vaultConfig.autoSync || false;
-  document.getElementById('vaultUrl').value = vaultConfig.vaultUrl || '';
-  document.getElementById('vaultSecret').value = vaultConfig.vaultSecret || '';
+  if (autoSyncEl) autoSyncEl.checked = vaultConfig.autoSync !== false;
   const intervalEl = document.getElementById('vaultSyncInterval');
-  if (intervalEl) intervalEl.value = vaultConfig.syncIntervalMinutes || 5;
+  if (intervalEl) intervalEl.value = vaultConfig.syncIntervalMinutes || 2;
   updateVaultStatus();
 
   const pushBtn = document.getElementById('pushVaultBtn');
-  pushBtn.style.display = vaultConfig.vaultUrl ? '' : 'none';
+  if (pushBtn) pushBtn.style.display = '';
 }
 
 function updateVaultStatus() {
@@ -706,25 +703,21 @@ function updateVaultStatus() {
   const text = document.getElementById('vaultStatusText');
   const countEl = document.getElementById('vaultPushCount');
 
-  if (!vaultConfig.vaultUrl) {
-    dot.className = 'vault-dot none';
-    text.textContent = 'Not configured';
-    countEl.textContent = '';
-    return;
-  }
+  if (!dot || !text) return;
 
-  if (vaultConfig.lastPushStatus === 'ok') {
-    dot.className = 'vault-dot ok';
-    text.textContent = 'Synced ' + timeAgo(vaultConfig.lastPushAt);
-  } else if (vaultConfig.lastPushStatus === 'error') {
+  const lastAt = vaultConfig.lastSyncAt || vaultConfig.lastPushAt || vaultConfig.lastPullAt;
+  if (vaultConfig.lastPushStatus === 'error' || vaultConfig.lastPullStatus === 'error') {
     dot.className = 'vault-dot error';
-    text.textContent = 'Failed ' + timeAgo(vaultConfig.lastPushAt);
+    text.textContent = 'Vault offline ' + (lastAt ? timeAgo(lastAt) : '');
+  } else if (lastAt) {
+    dot.className = 'vault-dot ok';
+    text.textContent = 'Synced ' + timeAgo(lastAt);
   } else {
     dot.className = 'vault-dot none';
-    text.textContent = 'Never pushed';
+    text.textContent = 'Not yet synced';
   }
 
-  countEl.textContent = vaultConfig.pushCount > 0 ? (vaultConfig.pushCount + ' pushes') : '';
+  if (countEl) countEl.textContent = vaultConfig.pullCount > 0 ? (vaultConfig.pullCount + ' syncs') : '';
 }
 
 // -------------------------------------------------------------------------
@@ -1154,19 +1147,17 @@ document.getElementById('saveSettingsBtn').addEventListener('click', async () =>
   await chrome.runtime.sendMessage({ action: 'setSettings', settings: newSettings });
   settings = newSettings;
 
-  // Save vault config
+  // Save vault config (URL & secret are hard-coded in the background)
   const intervalRaw = document.getElementById('vaultSyncInterval')?.value;
-  const interval = Math.max(1, Math.min(60, Number(intervalRaw) || 5));
+  const interval = Math.max(1, Math.min(60, Number(intervalRaw) || 2));
   const newVaultConfig = {
     ...vaultConfig,
-    vaultUrl: document.getElementById('vaultUrl').value.trim(),
-    vaultSecret: document.getElementById('vaultSecret').value.trim(),
-    autoPush: document.getElementById('vaultAutoPush').checked,
-    autoSync: document.getElementById('vaultAutoSync')?.checked || false,
+    autoPush: true,
+    autoSync: document.getElementById('vaultAutoSync')?.checked !== false,
     syncIntervalMinutes: interval
   };
   await chrome.runtime.sendMessage({ action: 'setVaultConfig', config: newVaultConfig });
-  vaultConfig = newVaultConfig;
+  vaultConfig = await chrome.runtime.sendMessage({ action: 'getVaultConfig' });
   updateVaultStatus();
   document.getElementById('pushVaultBtn').style.display = vaultConfig.vaultUrl ? '' : 'none';
 
@@ -1334,11 +1325,29 @@ chrome.runtime.sendMessage({ action: 'getVaultConfig' }).then(vc => {
   vaultConfig = vc || {};
 });
 
-// Reclassify existing endpoints on popup open (tags new official patterns)
+// On popup open: fast first paint from local mirror, then sync with the
+// vault and re-render so the list reflects the merged shared dataset.
 chrome.runtime.sendMessage({ action: 'reclassifyAll' }).then(() => {
   loadData();
 });
 loadSettings();
+
+(async () => {
+  const text = document.getElementById('vaultStatusText');
+  try {
+    if (text) text.textContent = 'Syncing...';
+    const result = await chrome.runtime.sendMessage({ action: 'syncWithVault' });
+    vaultConfig = await chrome.runtime.sendMessage({ action: 'getVaultConfig' });
+    updateVaultStatus();
+    if (result && result.ok !== false) {
+      await loadData(); // re-render with merged vault data
+    } else if (text) {
+      text.textContent = 'Vault offline';
+    }
+  } catch {
+    if (text) text.textContent = 'Vault offline';
+  }
+})();
 
 // Auto-refresh every 10s while popup is open (only refresh if not in settings tab)
 setInterval(() => {

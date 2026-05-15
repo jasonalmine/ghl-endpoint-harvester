@@ -995,14 +995,12 @@
       </select>
     </div>
 
-    <div class="settings-section-title">GHL Vault</div>
+    <div class="settings-section-title">Local Vault</div>
 
-    <div class="toggle-row">
-      <span class="toggle-label">Auto-push payloads to vault</span>
-      <label class="toggle-switch">
-        <input type="checkbox" id="vaultAutoPush">
-        <span class="toggle-slider"></span>
-      </label>
+    <div class="form-group">
+      <label>Vault address (fixed)</label>
+      <div style="font-family:monospace;font-size:12px;color:#4ade80;background:#111;border:1px solid #2a2a2a;border-radius:4px;padding:7px 9px;">http://127.0.0.1:7777</div>
+      <div class="hint">All profiles share this single local vault. Start it with <code>vault-server/install-macos.sh</code> (auto-runs on login) or <code>node vault-server/server.js</code>. The endpoint list reflects the merged vault.</div>
     </div>
 
     <div class="toggle-row">
@@ -1014,21 +1012,9 @@
     </div>
 
     <div class="form-group">
-      <label>Vault URL</label>
-      <input type="text" id="vaultUrl" placeholder="http://127.0.0.1:7777/api/ingest" />
-      <div class="hint">Local: <code>http://127.0.0.1:7777/api/ingest</code> (run <code>node vault-server/server.js</code>).</div>
-    </div>
-
-    <div class="form-group">
-      <label>Vault Secret</label>
-      <input type="text" id="vaultSecret" placeholder="(optional) X-Secret header value" />
-      <div class="hint">Leave blank for local vault unless you set <code>VAULT_SECRET</code>.</div>
-    </div>
-
-    <div class="form-group">
       <label>Sync interval (minutes)</label>
-      <input type="number" id="vaultSyncInterval" min="1" max="60" value="5" style="width:80px;" />
-      <div class="hint">How often the extension syncs when auto-sync is on.</div>
+      <input type="number" id="vaultSyncInterval" min="1" max="60" value="2" style="width:80px;" />
+      <div class="hint">How often this profile syncs with the vault when auto-sync is on. It also syncs every time you open this popup.</div>
     </div>
 
     <div class="form-group" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
