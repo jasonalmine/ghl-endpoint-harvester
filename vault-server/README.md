@@ -68,31 +68,33 @@ VAULT_PORT=9000 VAULT_DATA_FILE=~/ghl-vault.json node server.js
 The vault is the source of truth after a sync. Local state is replaced
 with the merged result on pull.
 
-## Run on boot (macOS launchd)
+## Run on boot (macOS)
 
-Create `~/Library/LaunchAgents/com.ventryx.ghl-vault.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>          <string>com.ventryx.ghl-vault</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/local/bin/node</string>
-    <string>/Users/jasonalmine/Projects/ghl-endpoint-harvester/vault-server/server.js</string>
-  </array>
-  <key>RunAtLoad</key>      <true/>
-  <key>KeepAlive</key>      <true/>
-  <key>StandardOutPath</key><string>/tmp/ghl-vault.log</string>
-  <key>StandardErrorPath</key><string>/tmp/ghl-vault.err</string>
-</dict>
-</plist>
-```
-
-Then:
+Use the install script — it wraps the server in a proper `.app` bundle so
+it shows as **"GHL Vault"** (not a generic "node") in System Settings >
+Login Items, ad-hoc code-signs it, and registers the launchd agent:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.ventryx.ghl-vault.plist
+./install-macos.sh
 ```
+
+This creates:
+- `~/Applications/GHL Vault.app` — the named, signed bundle
+- `~/Library/LaunchAgents/com.ventryx.ghl-vault.plist` — the launchd agent
+
+It auto-starts on every login and restarts if it crashes (`KeepAlive`).
+
+Uninstall:
+
+```bash
+./install-macos.sh remove
+```
+
+(`vault-data.json` is kept.)
+
+### Why the bundle?
+
+launchd running the bare `node` binary makes macOS label the background
+item "node — Item from unidentified developer". The `.app` bundle gives
+it a real `CFBundleDisplayName` so it appears as "GHL Vault" with a
+stable code identity.
