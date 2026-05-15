@@ -3,12 +3,15 @@
  * Intercepts GHL API requests and catalogs normalized endpoint patterns.
  */
 
+// Parent domains — wildcard-matched so EVERY subdomain is captured
+// (workflow/automation publish hits hosts beyond the old hard-coded
+// services./backend. list: app.gohighlevel.com internal API, other
+// *.leadconnectorhq.com services, etc.). Catch them all.
 const GHL_DOMAINS = [
-  'services.leadconnectorhq.com',
-  'backend.leadconnectorhq.com',
-  'api.msgsndr.com',
-  'rest.gohighlevel.com',
-  // Firebase domains (GHL uses these under the hood)
+  'leadconnectorhq.com',
+  'gohighlevel.com',
+  'msgsndr.com',
+  // Firebase / Google Identity (GHL uses these under the hood)
   'firebasestorage.googleapis.com',
   'firestore.googleapis.com',
   'identitytoolkit.googleapis.com',
@@ -840,9 +843,14 @@ async function setupListeners() {
   const settings = await getSettings();
   const captureState = await getCaptureState();
 
-  // Build URL patterns from active domains
-  const urlPatterns = settings.domains.flatMap(d => [
-    `*://${d}/*`
+  // Build URL patterns. Always cover the parent domains (apex + ALL
+  // subdomains) regardless of any stale stored settings.domains, plus
+  // any extra domains the user added in settings. This guarantees we
+  // see workflow publish no matter which subdomain GHL routes it to.
+  const captureDomains = [...new Set([...GHL_DOMAINS, ...(settings.domains || [])])];
+  const urlPatterns = captureDomains.flatMap(d => [
+    `*://${d}/*`,
+    `*://*.${d}/*`
   ]);
 
   // Capture request bodies for POST/PUT/PATCH/DELETE via webRequest (reliable fallback)

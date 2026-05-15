@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GHL Payload Harvester",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "Intercepts every GoHighLevel API call (documented or not) and captures full request + response payloads and headers for workflow reverse-engineering and automated deployment.",
   "permissions": [
     "webRequest",
@@ -32,7 +32,9 @@
       ],
       "js": ["interceptor.js"],
       "run_at": "document_start",
-      "world": "MAIN"
+      "world": "MAIN",
+      "all_frames": true,
+      "match_about_blank": true
     },
     {
       "matches": [
@@ -41,7 +43,9 @@
         "*://*.msgsndr.com/*"
       ],
       "js": ["bridge.js"],
-      "run_at": "document_start"
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true
     }
   ],
   "action": {

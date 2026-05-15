@@ -22,12 +22,14 @@
   // Domains and patterns to capture bodies for
   // -----------------------------------------------------------------------
 
+  // Parent domains — matched as suffixes so EVERY subdomain qualifies
+  // (workflow publish can route to app.gohighlevel.com internal API or
+  // other *.leadconnectorhq.com services, not just backend./services.).
   const API_DOMAINS = [
-    'backend.leadconnectorhq.com',
-    'services.leadconnectorhq.com',
-    'api.msgsndr.com',
-    'rest.gohighlevel.com',
-    // Firebase domains (GHL uses these under the hood)
+    'leadconnectorhq.com',
+    'gohighlevel.com',
+    'msgsndr.com',
+    // Firebase / Google Identity (GHL uses these under the hood)
     'firebasestorage.googleapis.com',
     'firestore.googleapis.com',
     'identitytoolkit.googleapis.com',
@@ -406,6 +408,82 @@
       if (json) postClipboardCapture(json, 'copy-event:application/json');
     } catch {}
   }, true);
+
+  // -----------------------------------------------------------------------
+  // WebSocket capture - GHL workflow/funnel builder uses sockets for live
+  // state; some actions (incl. publish acks) travel over an open socket
+  // that webRequest never sees (it only sees the handshake).
+  // -----------------------------------------------------------------------
+
+  try {
+    const OriginalWebSocket = window.WebSocket;
+    if (OriginalWebSocket) {
+      const WSProxy = function (url, protocols) {
+        const ws = protocols !== undefined
+          ? new OriginalWebSocket(url, protocols)
+          : new OriginalWebSocket(url);
+
+        const wsUrl = String(url);
+        const isGhlWs = (() => {
+          try {
+            const h = new URL(wsUrl).hostname;
+            return API_DOMAINS.some(d => h === d || h.endsWith('.' + d));
+          } catch { return false; }
+        })();
+
+        if (isGhlWs) {
+          const origSend = ws.send.bind(ws);
+          ws.send = function (data) {
+            try {
+              postCapture({
+                url: wsUrl,
+                method: 'WS_SEND',
+                status: 0,
+                requestBody: serializeRequestBody(data),
+                responseBody: null,
+                responseJson: null,
+                contentType: 'websocket',
+                requestHeaders: null,
+                responseHeaders: null,
+                authHeaders: null,
+                timestamp: Date.now()
+              });
+            } catch {}
+            return origSend(data);
+          };
+
+          ws.addEventListener('message', (ev) => {
+            try {
+              let body = null;
+              if (typeof ev.data === 'string') body = ev.data;
+              else if (ev.data instanceof Blob) body = '[Blob]';
+              else body = serializeRequestBody(ev.data);
+              postCapture({
+                url: wsUrl,
+                method: 'WS_RECV',
+                status: 0,
+                requestBody: null,
+                responseBody: truncateBody(body),
+                responseJson: typeof body === 'string' ? safeParseJson(body) : null,
+                contentType: 'websocket',
+                requestHeaders: null,
+                responseHeaders: null,
+                authHeaders: null,
+                timestamp: Date.now()
+              });
+            } catch {}
+          });
+        }
+        return ws;
+      };
+      WSProxy.prototype = OriginalWebSocket.prototype;
+      WSProxy.CONNECTING = OriginalWebSocket.CONNECTING;
+      WSProxy.OPEN = OriginalWebSocket.OPEN;
+      WSProxy.CLOSING = OriginalWebSocket.CLOSING;
+      WSProxy.CLOSED = OriginalWebSocket.CLOSED;
+      window.WebSocket = WSProxy;
+    }
+  } catch {}
 
   // -----------------------------------------------------------------------
   // Console marker (visible in DevTools)
