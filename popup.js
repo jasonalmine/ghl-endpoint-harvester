@@ -689,8 +689,12 @@ async function loadSettings() {
 async function loadVaultConfig() {
   vaultConfig = await chrome.runtime.sendMessage({ action: 'getVaultConfig' });
   document.getElementById('vaultAutoPush').checked = vaultConfig.autoPush || false;
+  const autoSyncEl = document.getElementById('vaultAutoSync');
+  if (autoSyncEl) autoSyncEl.checked = vaultConfig.autoSync || false;
   document.getElementById('vaultUrl').value = vaultConfig.vaultUrl || '';
   document.getElementById('vaultSecret').value = vaultConfig.vaultSecret || '';
+  const intervalEl = document.getElementById('vaultSyncInterval');
+  if (intervalEl) intervalEl.value = vaultConfig.syncIntervalMinutes || 5;
   updateVaultStatus();
 
   const pushBtn = document.getElementById('pushVaultBtn');
@@ -1051,6 +1055,50 @@ document.getElementById('pushVaultBtn').addEventListener('click', async () => {
   setTimeout(() => { btn.textContent = origText; }, 2000);
 });
 
+// Sync Now / Pull / Push (settings tab vault buttons)
+async function runVaultOp(action, btnId, label) {
+  const btn = document.getElementById(btnId);
+  if (!btn) return;
+  const orig = btn.textContent;
+  const resultEl = document.getElementById('vaultSyncResult');
+  btn.textContent = label + '...';
+  btn.disabled = true;
+  if (resultEl) resultEl.textContent = '';
+  try {
+    const result = await chrome.runtime.sendMessage({ action });
+    if (result && result.ok !== false) {
+      btn.textContent = 'Done';
+      vaultConfig = await chrome.runtime.sendMessage({ action: 'getVaultConfig' });
+      updateVaultStatus();
+      if (resultEl) {
+        if (action === 'syncWithVault' && result.pull) {
+          const p = result.pull;
+          resultEl.textContent = `Synced — ${p.totalEndpoints} endpoints, ${p.totalPayloads} payloads (added ${p.endpointsAdded} ep / ${p.payloadsAdded} pl from vault)`;
+        } else if (action === 'pullFromVault') {
+          resultEl.textContent = `Pulled — ${result.totalEndpoints} endpoints, ${result.totalPayloads} payloads (added ${result.endpointsAdded} ep / ${result.payloadsAdded} pl)`;
+        } else {
+          resultEl.textContent = `Pushed — ${result.endpointCount || ''} endpoints, ${result.payloadCount || ''} payloads`;
+        }
+      }
+      // Refresh the lists if changed
+      try { allEndpoints = await chrome.runtime.sendMessage({ action: 'getEndpoints' }); renderEndpoints(); } catch {}
+      try { allPayloads = await chrome.runtime.sendMessage({ action: 'getPayloads' }); renderPayloads(); } catch {}
+    } else {
+      btn.textContent = 'Failed';
+      if (resultEl) resultEl.textContent = `Failed: ${result?.error || 'unknown error'}`;
+    }
+  } catch (e) {
+    btn.textContent = 'Error';
+    if (resultEl) resultEl.textContent = `Error: ${e.message}`;
+  }
+  btn.disabled = false;
+  setTimeout(() => { btn.textContent = orig; }, 2500);
+}
+
+document.getElementById('vaultSyncNowBtn')?.addEventListener('click', () => runVaultOp('syncWithVault', 'vaultSyncNowBtn', 'Syncing'));
+document.getElementById('vaultPullBtn')?.addEventListener('click',   () => runVaultOp('pullFromVault',  'vaultPullBtn',    'Pulling'));
+document.getElementById('vaultPushBtn')?.addEventListener('click',   () => runVaultOp('pushToVault',    'vaultPushBtn',    'Pushing'));
+
 // Search / filter changes
 document.getElementById('searchInput').addEventListener('input', () => {
   displayedCount = 50;
@@ -1107,11 +1155,15 @@ document.getElementById('saveSettingsBtn').addEventListener('click', async () =>
   settings = newSettings;
 
   // Save vault config
+  const intervalRaw = document.getElementById('vaultSyncInterval')?.value;
+  const interval = Math.max(1, Math.min(60, Number(intervalRaw) || 5));
   const newVaultConfig = {
     ...vaultConfig,
     vaultUrl: document.getElementById('vaultUrl').value.trim(),
     vaultSecret: document.getElementById('vaultSecret').value.trim(),
-    autoPush: document.getElementById('vaultAutoPush').checked
+    autoPush: document.getElementById('vaultAutoPush').checked,
+    autoSync: document.getElementById('vaultAutoSync')?.checked || false,
+    syncIntervalMinutes: interval
   };
   await chrome.runtime.sendMessage({ action: 'setVaultConfig', config: newVaultConfig });
   vaultConfig = newVaultConfig;

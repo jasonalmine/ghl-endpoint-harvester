@@ -399,14 +399,150 @@ async function getSettings() {
 
 async function getVaultConfig() {
   const result = await chrome.storage.local.get('vaultConfig');
-  return result.vaultConfig || {
+  return {
     vaultUrl: '',
     vaultSecret: '',
     autoPush: false,
+    autoSync: false,
+    syncIntervalMinutes: 5,
     lastPushAt: null,
     lastPushStatus: null,
-    pushCount: 0
+    pushCount: 0,
+    lastPullAt: null,
+    lastPullStatus: null,
+    pullCount: 0,
+    lastSyncAt: null,
+    ...(result.vaultConfig || {})
   };
+}
+
+// -------------------------------------------------------------------------
+// Vault: pull + merge (multi-profile sync)
+// -------------------------------------------------------------------------
+
+const AUTH_RANK = { bearer: 4, apikey: 3, 'firebase-jwt': 2, other: 1, none: 0 };
+
+function uniq(arr) { return [...new Set(arr)]; }
+
+function mergeEndpointShape(target, incoming) {
+  if (!target) return JSON.parse(JSON.stringify(incoming));
+  target.hitCount = (target.hitCount || 0) + (incoming.hitCount || 0);
+  target.lastSeen = Math.max(target.lastSeen || 0, incoming.lastSeen || 0);
+  target.firstSeen = Math.min(
+    target.firstSeen || incoming.firstSeen || Date.now(),
+    incoming.firstSeen || target.firstSeen || Date.now()
+  );
+  target.queryParams = uniq([...(target.queryParams || []), ...(incoming.queryParams || [])]);
+  target.statusCodes = uniq([...(target.statusCodes || []), ...(incoming.statusCodes || [])]);
+  target.sampleUrls = uniq([...(incoming.sampleUrls || []), ...(target.sampleUrls || [])]).slice(0, 3);
+  target.tags = uniq([...(target.tags || []), ...(incoming.tags || [])]);
+  if (incoming.starred) target.starred = true;
+  if (incoming.notes && !target.notes) target.notes = incoming.notes;
+  if ((AUTH_RANK[incoming.authType] || 0) > (AUTH_RANK[target.authType] || 0)) {
+    target.authType = incoming.authType;
+  }
+  if (incoming.apiStatus === 'official') target.apiStatus = 'official';
+  return target;
+}
+
+function sigOfSampleClient(s) {
+  const body = s && s.requestBody ? String(s.requestBody) : '';
+  return `${(s && s.status) || 0}|${body.length}|${body.substring(0, 200)}`;
+}
+
+function mergePayloadShape(target, incoming) {
+  if (!target) return JSON.parse(JSON.stringify(incoming));
+  const stripSamples = (p) => { if (!p) return p; const { samples, captureCount, ...rest } = p; return rest; };
+  const incomingSamples = incoming.samples && incoming.samples.length > 0 ? incoming.samples : [stripSamples(incoming)];
+  const targetSamples = target.samples && target.samples.length > 0 ? target.samples : [stripSamples(target)];
+
+  const all = [...incomingSamples, ...targetSamples];
+  const seen = new Set();
+  const deduped = [];
+  for (const s of all) {
+    const sig = sigOfSampleClient(s);
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    deduped.push(s);
+  }
+  deduped.sort((a, b) => (b.capturedAt || 0) - (a.capturedAt || 0));
+  const top = deduped.slice(0, 5);
+  return {
+    ...top[0],
+    samples: top,
+    captureCount: (target.captureCount || 0) + (incoming.captureCount || 0)
+  };
+}
+
+async function pullFromVault() {
+  const vc = await getVaultConfig();
+  if (!vc.vaultUrl) throw new Error('Vault URL not configured');
+
+  const stateUrl = vc.vaultUrl.replace(/\/api\/ingest(\/bulk)?$/, '/api/state');
+  const resp = await fetch(stateUrl, {
+    method: 'GET',
+    headers: { ...(vc.vaultSecret ? { 'X-Secret': vc.vaultSecret } : {}) }
+  });
+  if (!resp.ok) throw new Error(`Vault pull failed: ${resp.status}`);
+  const remote = await resp.json();
+
+  const [endpoints, payloads, settings] = await Promise.all([
+    getEndpoints(), getPayloads(), getSettings()
+  ]);
+
+  // Merge remote into local (conflict resolution favors union)
+  let epAdded = 0, epMerged = 0, plAdded = 0, plMerged = 0;
+  for (const [k, v] of Object.entries(remote.endpoints || {})) {
+    if (endpoints[k]) epMerged++; else epAdded++;
+    endpoints[k] = mergeEndpointShape(endpoints[k], v);
+  }
+  for (const [k, v] of Object.entries(remote.payloads || {})) {
+    if (payloads[k]) plMerged++; else plAdded++;
+    payloads[k] = mergePayloadShape(payloads[k], v);
+  }
+
+  // Enforce caps after merge
+  const epKeys = Object.keys(endpoints);
+  if (epKeys.length > (settings.maxEndpoints || 500)) {
+    const sorted = epKeys.sort((a, b) => (endpoints[b].lastSeen || 0) - (endpoints[a].lastSeen || 0));
+    const toKeep = sorted.slice(0, settings.maxEndpoints || 500);
+    const next = {};
+    for (const k of toKeep) next[k] = endpoints[k];
+    for (const k of Object.keys(endpoints)) if (!next[k]) delete endpoints[k];
+  }
+  const plKeys = Object.keys(payloads);
+  if (plKeys.length > MAX_PAYLOAD_ENTRIES) {
+    const sorted = plKeys.sort((a, b) => (payloads[b].capturedAt || 0) - (payloads[a].capturedAt || 0));
+    const toKeep = new Set(sorted.slice(0, MAX_PAYLOAD_ENTRIES));
+    for (const k of plKeys) if (!toKeep.has(k)) delete payloads[k];
+  }
+
+  await chrome.storage.local.set({ endpoints, payloads });
+
+  vc.lastPullAt = Date.now();
+  vc.lastPullStatus = 'ok';
+  vc.pullCount = (vc.pullCount || 0) + 1;
+  await chrome.storage.local.set({ vaultConfig: vc });
+
+  updateBadge();
+
+  return {
+    ok: true,
+    endpointsAdded: epAdded, endpointsMerged: epMerged,
+    payloadsAdded: plAdded, payloadsMerged: plMerged,
+    totalEndpoints: Object.keys(endpoints).length,
+    totalPayloads: Object.keys(payloads).length
+  };
+}
+
+async function syncWithVault() {
+  // Push local -> server (server merges) -> pull merged state -> merge into local
+  const pushResult = await pushBulkToVault();
+  const pullResult = await pullFromVault();
+  const vc = await getVaultConfig();
+  vc.lastSyncAt = Date.now();
+  await chrome.storage.local.set({ vaultConfig: vc });
+  return { ok: true, push: pushResult, pull: pullResult };
 }
 
 async function pushPayloadToVault(epKey, payloadData) {
@@ -1368,7 +1504,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.action === 'setVaultConfig') {
-    chrome.storage.local.set({ vaultConfig: msg.config }).then(() => sendResponse({ ok: true }));
+    chrome.storage.local.set({ vaultConfig: msg.config }).then(async () => {
+      await rescheduleSyncAlarm();
+      sendResponse({ ok: true });
+    });
     return true;
   }
 
@@ -1385,12 +1524,59 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch(err => sendResponse({ ok: false, error: err.message }));
     return true;
   }
+
+  if (msg.action === 'pullFromVault') {
+    pullFromVault()
+      .then(result => sendResponse(result))
+      .catch(err => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+
+  if (msg.action === 'syncWithVault') {
+    syncWithVault()
+      .then(result => sendResponse(result))
+      .catch(err => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+
+  if (msg.action === 'reschedSync') {
+    rescheduleSyncAlarm()
+      .then(() => sendResponse({ ok: true }))
+      .catch(err => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
 });
 
 // Periodic cleanup alarm: flush any remaining buffer
 chrome.alarms.create('bufferFlush', { periodInMinutes: 1 });
-chrome.alarms.onAlarm.addListener((alarm) => {
+
+// Auto-sync alarm — re-created whenever vault config changes
+async function rescheduleSyncAlarm() {
+  await chrome.alarms.clear('vaultSync');
+  const vc = await getVaultConfig();
+  if (vc.autoSync && vc.vaultUrl) {
+    const minutes = Math.max(1, Number(vc.syncIntervalMinutes) || 5);
+    chrome.alarms.create('vaultSync', { periodInMinutes: minutes, delayInMinutes: minutes });
+    console.log(`[vault] auto-sync scheduled every ${minutes} min`);
+  } else {
+    console.log('[vault] auto-sync disabled');
+  }
+}
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'bufferFlush') {
     if (Object.keys(writeBuffer).length > 0) flushBuffer();
+    return;
+  }
+  if (alarm.name === 'vaultSync') {
+    try {
+      const result = await syncWithVault();
+      console.log('[vault] auto-sync done', result);
+    } catch (e) {
+      console.warn('[vault] auto-sync failed:', e.message);
+    }
   }
 });
+
+// Initialize the sync alarm on startup
+rescheduleSyncAlarm().catch(() => {});

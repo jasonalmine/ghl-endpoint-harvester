@@ -1005,25 +1005,43 @@
       </label>
     </div>
 
+    <div class="toggle-row">
+      <span class="toggle-label">Auto-sync (push + pull on interval)</span>
+      <label class="toggle-switch">
+        <input type="checkbox" id="vaultAutoSync">
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+
     <div class="form-group">
       <label>Vault URL</label>
-      <input type="text" id="vaultUrl" placeholder="http://164.68.102.157:7850/api/ingest" />
-      <div class="hint">The GHL Vault receiver endpoint on your VPS.</div>
+      <input type="text" id="vaultUrl" placeholder="http://127.0.0.1:7777/api/ingest" />
+      <div class="hint">Local: <code>http://127.0.0.1:7777/api/ingest</code> (run <code>node vault-server/server.js</code>).</div>
     </div>
 
     <div class="form-group">
       <label>Vault Secret</label>
-      <input type="text" id="vaultSecret" placeholder="Your X-Secret header value" />
-      <div class="hint">Shared secret for authenticating with the vault.</div>
+      <input type="text" id="vaultSecret" placeholder="(optional) X-Secret header value" />
+      <div class="hint">Leave blank for local vault unless you set <code>VAULT_SECRET</code>.</div>
     </div>
 
-    <div class="form-group" style="display:flex;align-items:center;gap:8px;">
-      <span class="vault-status" id="vaultStatus">
+    <div class="form-group">
+      <label>Sync interval (minutes)</label>
+      <input type="number" id="vaultSyncInterval" min="1" max="60" value="5" style="width:80px;" />
+      <div class="hint">How often the extension syncs when auto-sync is on.</div>
+    </div>
+
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+      <button class="btn primary" id="vaultSyncNowBtn">Sync Now</button>
+      <button class="btn" id="vaultPullBtn">Pull</button>
+      <button class="btn" id="vaultPushBtn">Push</button>
+      <span class="vault-status" id="vaultStatus" style="margin-left:auto;">
         <span class="vault-dot none" id="vaultDot"></span>
         <span id="vaultStatusText">Not configured</span>
       </span>
-      <span style="font-size:11px;color:#555;" id="vaultPushCount"></span>
     </div>
+    <div style="font-size:11px;color:#555;margin-top:4px;" id="vaultPushCount"></div>
+    <div style="font-size:11px;color:#777;margin-top:4px;" id="vaultSyncResult"></div>
 
     <div class="settings-section-title">Data</div>
 
