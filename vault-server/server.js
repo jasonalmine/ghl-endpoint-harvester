@@ -44,18 +44,69 @@ const DATA_FILE = process.env.VAULT_DATA_FILE
 
 let state = { endpoints: {}, payloads: {}, updatedAt: null };
 
-try {
-  if (fs.existsSync(DATA_FILE)) {
-    state = JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
-    if (!state.endpoints) state.endpoints = {};
-    if (!state.payloads) state.payloads = {};
+// Backup files rotated on each persist: .bak.1 (most recent) -> .bak.3.
+// On startup-corruption, restore from the freshest valid backup before
+// EVER starting with an empty state — a fresh start on top of a real
+// data file would let the next push overwrite real history with little.
+const BACKUP_SUFFIXES = ['.bak.1', '.bak.2', '.bak.3'];
+
+function tryLoadFile(path) {
+  try {
+    if (!fs.existsSync(path)) return null;
+    const parsed = JSON.parse(fs.readFileSync(path, 'utf-8'));
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (!parsed.endpoints) parsed.endpoints = {};
+    if (!parsed.payloads) parsed.payloads = {};
+    return parsed;
+  } catch (e) {
+    console.warn(`[vault] could not parse ${path}: ${e.message}`);
+    return null;
   }
-} catch (e) {
-  console.warn(`[vault] failed to load state from ${DATA_FILE}: ${e.message}. Starting fresh.`);
-  state = { endpoints: {}, payloads: {}, updatedAt: null };
+}
+
+function loadStateWithRecovery() {
+  const candidates = [DATA_FILE, ...BACKUP_SUFFIXES.map(s => DATA_FILE + s)];
+  for (const f of candidates) {
+    const loaded = tryLoadFile(f);
+    if (loaded) {
+      const ep = Object.keys(loaded.endpoints).length;
+      const pl = Object.keys(loaded.payloads).length;
+      if (f !== DATA_FILE) {
+        console.warn(`[vault] RECOVERED state from backup ${f} (${ep} endpoints, ${pl} payloads). Main file was unreadable.`);
+        // Quarantine the bad main file before we overwrite it.
+        try {
+          if (fs.existsSync(DATA_FILE)) {
+            const quarantine = DATA_FILE + '.corrupt.' + Date.now();
+            fs.renameSync(DATA_FILE, quarantine);
+            console.warn(`[vault] quarantined unreadable file -> ${quarantine}`);
+          }
+        } catch (e) { console.warn(`[vault] quarantine failed: ${e.message}`); }
+      }
+      return loaded;
+    }
+  }
+  console.warn(`[vault] no valid data or backups found; starting fresh.`);
+  return { endpoints: {}, payloads: {}, updatedAt: null };
+}
+
+state = loadStateWithRecovery();
+
+function rotateBackups() {
+  // .bak.2 -> .bak.3, .bak.1 -> .bak.2, current -> .bak.1  (best-effort)
+  try {
+    for (let i = BACKUP_SUFFIXES.length - 1; i > 0; i--) {
+      const src = DATA_FILE + BACKUP_SUFFIXES[i - 1];
+      const dst = DATA_FILE + BACKUP_SUFFIXES[i];
+      if (fs.existsSync(src)) fs.renameSync(src, dst);
+    }
+    if (fs.existsSync(DATA_FILE)) {
+      fs.copyFileSync(DATA_FILE, DATA_FILE + BACKUP_SUFFIXES[0]);
+    }
+  } catch (e) { /* non-fatal */ }
 }
 
 let writeTimer = null;
+let writesSinceRotate = 0;
 function persist() {
   if (writeTimer) return;
   writeTimer = setTimeout(() => {
@@ -66,6 +117,10 @@ function persist() {
         console.warn(`[vault] write failed: ${err.message}`);
         return;
       }
+      // Rotate backups once every ~10 writes so .bak.1 isn't always the
+      // exact-same file as the live one (gives real recovery headroom)
+      // without thrashing disk on every keystroke.
+      if (writesSinceRotate++ % 10 === 0) rotateBackups();
       fs.rename(tmp, DATA_FILE, (err2) => {
         if (err2) console.warn(`[vault] rename failed: ${err2.message}`);
       });

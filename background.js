@@ -38,7 +38,11 @@ const IGNORED_PATH_PATTERNS = [
 // Default settings
 const DEFAULT_SETTINGS = {
   autoCaptureOnStartup: true,
-  maxEndpoints: 500,
+  // Bumped from 500: the local mirror should comfortably hold the shared
+  // vault's full set on a fresh install (so removing+reinstalling the
+  // extension doesn't visually look like data loss). The vault itself is
+  // never reduced by a push — it only merges.
+  maxEndpoints: 5000,
   domains: [...GHL_DOMAINS],
   exportFormat: 'json',
   // Local ghl-token-harvester daemon (configurable; verified via GET /health).
@@ -612,21 +616,10 @@ async function pullFromVault() {
     payloads[k] = mergePayloadShape(payloads[k], v);
   }
 
-  // Enforce caps after merge
-  const epKeys = Object.keys(endpoints);
-  if (epKeys.length > (settings.maxEndpoints || 500)) {
-    const sorted = epKeys.sort((a, b) => (endpoints[b].lastSeen || 0) - (endpoints[a].lastSeen || 0));
-    const toKeep = sorted.slice(0, settings.maxEndpoints || 500);
-    const next = {};
-    for (const k of toKeep) next[k] = endpoints[k];
-    for (const k of Object.keys(endpoints)) if (!next[k]) delete endpoints[k];
-  }
-  const plKeys = Object.keys(payloads);
-  if (plKeys.length > MAX_PAYLOAD_ENTRIES) {
-    const sorted = plKeys.sort((a, b) => (payloads[b].capturedAt || 0) - (payloads[a].capturedAt || 0));
-    const toKeep = new Set(sorted.slice(0, MAX_PAYLOAD_ENTRIES));
-    for (const k of plKeys) if (!toKeep.has(k)) delete payloads[k];
-  }
+  // No trimming on pull — the vault is the source of truth and the popup
+  // should reflect it in full. The capture-time cap (flushBuffer using
+  // settings.maxEndpoints) still bounds locally-captured endpoints.
+  // Payloads from the vault are likewise kept intact.
 
   await chrome.storage.local.set({ endpoints, payloads });
 
