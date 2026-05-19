@@ -262,6 +262,9 @@ function renderEndpointCard([key, ep]) {
         </span>
         <span class="auth-tag ${authClass}">${escapeHtml(authLabel)}</span>
         <span class="api-status-tag api-status-${escapeHtml(ep.apiStatus || 'undocumented')}">${escapeHtml(ep.apiStatus || 'undocumented')}</span>
+        ${ep.pagination && ep.pagination.paginated ? `<span class="api-status-tag" style="background:#1e3a5f;color:#7dd3fc;" title="Paginated (${escapeHtml((ep.pagination.params||[]).join(', '))})">paginated:${escapeHtml(ep.pagination.style || 'page')}</span>` : ''}
+        ${ep.needsRefetch ? `<span class="api-status-tag" style="background:#4a2f1e;color:#fdba74;" title="Seen only via Resource Timing (SPA cache) — no body/auth yet. Force refetch to capture fully.">needs refetch</span>` : ''}
+        ${ep.lastReplayedAt ? `<span class="api-status-tag" style="background:#1e4a2f;color:#86efac;" title="Replayed ${timeAgo(ep.lastReplayedAt)}">replayed</span>` : ''}
       </div>
 
       ${statusTagsHtml ? `<div style="margin-bottom:4px;">${statusTagsHtml}</div>` : ''}
@@ -285,6 +288,8 @@ function renderEndpointCard([key, ep]) {
         <button class="btn icon-btn" data-notes-toggle="${escapeHtml(key)}" title="Add/edit notes">Notes</button>
         <button class="btn icon-btn" data-add-tag="${escapeHtml(key)}" title="Add tag">+ Tag</button>
         ${allPayloads[key] ? `<button class="btn icon-btn" data-view-payload="${escapeHtml(key)}" title="View captured payload" style="color:#a855f7;">Body</button>` : ''}
+        <button class="btn icon-btn" data-test-endpoint="${escapeHtml(key)}" title="Replay this endpoint with a fresh token" style="color:#4ade80;">Test</button>
+        ${ep.needsRefetch ? `<button class="btn icon-btn" data-force-refetch="${escapeHtml(key)}" title="Reload the GHL tab bypassing cache so the SPA re-issues this call" style="color:#fdba74;">Refetch</button>` : ''}
         <button class="btn icon-btn danger" data-delete="${escapeHtml(key)}" title="Delete endpoint">Del</button>
         <span class="inline-feedback" id="fb-${escapeHtml(key)}"></span>
       </div>
@@ -560,6 +565,53 @@ function bindCardActions(list) {
       }
     });
   });
+
+  // Test endpoint (replay with a fresh token)
+  list.querySelectorAll('[data-test-endpoint]').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const key = e.currentTarget.dataset.testEndpoint;
+      const orig = btn.textContent;
+      btn.textContent = 'Testing…';
+      btn.disabled = true;
+      try {
+        const r = await chrome.runtime.sendMessage({ action: 'replayEndpoint', epKey: key, sampleIndex: 0 });
+        if (r && r.ok) {
+          showFeedback(key, `${r.status} in ${r.latencyMs}ms${r.usedFreshToken ? '' : ' (no fresh token)'} — saved`, 4000);
+          await loadData();
+        } else {
+          showFeedback(key, `Failed: ${(r && (r.error || ('HTTP ' + r.status))) || 'unknown'}`, 6000);
+        }
+      } catch (err) {
+        showFeedback(key, `Error: ${err.message}`, 6000);
+      }
+      btn.textContent = orig;
+      btn.disabled = false;
+    });
+  });
+
+  // Force refetch (cache-bust reload of an open GHL tab)
+  list.querySelectorAll('[data-force-refetch]').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const key = e.currentTarget.dataset.forceRefetch;
+      const orig = btn.textContent;
+      btn.textContent = 'Reloading…';
+      btn.disabled = true;
+      try {
+        const r = await chrome.runtime.sendMessage({ action: 'forceRefetch', epKey: key });
+        showFeedback(
+          key,
+          r && r.ok
+            ? `Reloaded GHL tab (bypass cache). Re-open this popup in a few seconds.`
+            : `Failed: ${(r && r.error) || 'no GHL tab open'}`,
+          6000
+        );
+      } catch (err) {
+        showFeedback(key, `Error: ${err.message}`, 6000);
+      }
+      btn.textContent = orig;
+      btn.disabled = false;
+    });
+  });
 }
 
 // -------------------------------------------------------------------------
@@ -678,6 +730,10 @@ async function loadSettings() {
   document.getElementById('autoCapture').checked = settings.autoCaptureOnStartup !== false;
   document.getElementById('maxEndpoints').value = settings.maxEndpoints || 500;
   document.getElementById('exportFormat').value = settings.exportFormat || 'json';
+  const tdu = document.getElementById('tokenDaemonUrl');
+  if (tdu) tdu.value = settings.tokenDaemonUrl || 'http://127.0.0.1:7787';
+  const amr = document.getElementById('allowMutatingReplay');
+  if (amr) amr.checked = !!settings.allowMutatingReplay;
   renderSettingsDomains(settings.domains || []);
   await loadVaultConfig();
 }
@@ -1133,6 +1189,29 @@ document.getElementById('showMoreBtn').addEventListener('click', () => {
 });
 
 // Settings - save
+document.getElementById('probeTokenBtn')?.addEventListener('click', async () => {
+  const btn = document.getElementById('probeTokenBtn');
+  const out = document.getElementById('tokenProbeResult');
+  const url = (document.getElementById('tokenDaemonUrl')?.value || '').trim();
+  const orig = btn.textContent;
+  btn.textContent = 'Probing…';
+  btn.disabled = true;
+  if (out) out.textContent = '';
+  try {
+    const r = await chrome.runtime.sendMessage({ action: 'probeTokenDaemon', url });
+    if (out) {
+      out.textContent = r && r.ok
+        ? `OK ${r.status} @ ${r.base}`
+        : `Unreachable: ${(r && (r.error || r.status)) || 'no response'} @ ${(r && r.base) || url}`;
+      out.style.color = r && r.ok ? '#4ade80' : '#ef4444';
+    }
+  } catch (e) {
+    if (out) { out.textContent = `Error: ${e.message}`; out.style.color = '#ef4444'; }
+  }
+  btn.textContent = orig;
+  btn.disabled = false;
+});
+
 document.getElementById('saveSettingsBtn').addEventListener('click', async () => {
   const domainInputs = document.querySelectorAll('.domain-input');
   const domains = [...domainInputs].map(i => i.value.trim()).filter(Boolean);
@@ -1141,7 +1220,9 @@ document.getElementById('saveSettingsBtn').addEventListener('click', async () =>
     autoCaptureOnStartup: document.getElementById('autoCapture').checked,
     maxEndpoints: parseInt(document.getElementById('maxEndpoints').value, 10) || 500,
     domains: domains.length ? domains : settings.domains,
-    exportFormat: document.getElementById('exportFormat').value
+    exportFormat: document.getElementById('exportFormat').value,
+    tokenDaemonUrl: (document.getElementById('tokenDaemonUrl')?.value || '').trim() || 'http://127.0.0.1:7787',
+    allowMutatingReplay: !!document.getElementById('allowMutatingReplay')?.checked
   };
 
   await chrome.runtime.sendMessage({ action: 'setSettings', settings: newSettings });

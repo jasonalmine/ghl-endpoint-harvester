@@ -1029,6 +1029,28 @@
     <div style="font-size:11px;color:#555;margin-top:4px;" id="vaultPushCount"></div>
     <div style="font-size:11px;color:#777;margin-top:4px;" id="vaultSyncResult"></div>
 
+    <div class="settings-section-title">Replay / Token Daemon</div>
+
+    <div class="form-group">
+      <label>Token daemon URL</label>
+      <input type="text" id="tokenDaemonUrl" placeholder="http://127.0.0.1:7787" />
+      <div class="hint">Local ghl-token-harvester daemon. Used to inject a fresh token when you click "Test" on an endpoint.</div>
+    </div>
+
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+      <button class="btn" id="probeTokenBtn">Probe /health</button>
+      <span style="font-size:11px;color:#777;" id="tokenProbeResult"></span>
+    </div>
+
+    <div class="toggle-row">
+      <span class="toggle-label">Allow non-GET replay (writes can mutate data)</span>
+      <label class="toggle-switch">
+        <input type="checkbox" id="allowMutatingReplay">
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+    <div class="hint" style="margin-top:-4px;margin-bottom:8px;">Off by default. "Test" only replays GET requests unless this is on.</div>
+
     <div class="settings-section-title">Data</div>
 
     <div style="display:flex; align-items:center; gap:10px;">

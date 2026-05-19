@@ -97,12 +97,37 @@ function mergeEndpoint(target, incoming) {
     target.authType = incoming.authType;
   }
   if (incoming.apiStatus === 'official') target.apiStatus = 'official';
+
+  // Additive optional fields (back-compat: absent on old clients).
+  if (incoming.pagination) {
+    const tp = target.pagination || { paginated: false, style: null, params: [] };
+    target.pagination = {
+      paginated: tp.paginated || incoming.pagination.paginated || false,
+      style: tp.style || incoming.pagination.style || null,
+      params: uniq([...(tp.params || []), ...(incoming.pagination.params || [])])
+    };
+  }
+  if (incoming.discoveredVia && !target.discoveredVia) target.discoveredVia = incoming.discoveredVia;
+  // A real capture (status codes present) clears needsRefetch / resource-only origin
+  if ((target.statusCodes || []).length > 0) {
+    target.needsRefetch = false;
+    if (target.discoveredVia === 'resource-timing') delete target.discoveredVia;
+  } else if (incoming.needsRefetch) {
+    target.needsRefetch = true;
+  }
+  target.lastReplayedAt = Math.max(target.lastReplayedAt || 0, incoming.lastReplayedAt || 0) || target.lastReplayedAt;
   return target;
 }
 
+// Mirrors the extension's sampleSignature: includes header-only/body marker
+// + source + method so a header-only or replay sample never collapses (and
+// thus evicts) a real body sample for the same endpoint.
 function sigOfSample(s) {
-  const body = s && s.requestBody ? String(s.requestBody) : '';
-  return `${(s && s.status) || 0}|${body.length}|${body.substring(0, 200)}`;
+  if (!s) return 'H||||0|0|';
+  const body = s.requestBody ? String(s.requestBody) : '';
+  const headerOnly = (!s.requestBody && !s.responseBody) ? 'H' : 'B';
+  const src = s.source || '';
+  return `${headerOnly}|${src}|${s.method || ''}|${s.status || 0}|${body.length}|${body.substring(0, 200)}`;
 }
 
 function mergePayload(target, incoming) {
@@ -127,10 +152,18 @@ function mergePayload(target, incoming) {
   deduped.sort((a, b) => (b.capturedAt || 0) - (a.capturedAt || 0));
   const top = deduped.slice(0, 5);
 
+  // Top-level mirror = richest sample (responseBody > requestBody > recent)
+  // so header-only / replay samples can't regress the visible payload.
+  const primary =
+    top.find(s => s.responseBody) ||
+    top.find(s => s.requestBody) ||
+    top[0];
+
   return {
-    ...top[0],
+    ...primary,
     samples: top,
-    captureCount: (target.captureCount || 0) + (incoming.captureCount || 0)
+    captureCount: (target.captureCount || 0) + (incoming.captureCount || 0),
+    lastReplayedAt: Math.max(target.lastReplayedAt || 0, incoming.lastReplayedAt || 0) || undefined
   };
 }
 
