@@ -656,6 +656,203 @@ async function syncWithVault() {
   return { ok: true, push: pushResult, pull: pullResult };
 }
 
+// -------------------------------------------------------------------------
+// Token daemon integration (ghl-token-harvester) — configurable + probed
+// -------------------------------------------------------------------------
+
+async function getTokenDaemonBase() {
+  const s = await getSettings();
+  return String(s.tokenDaemonUrl || DEFAULT_SETTINGS.tokenDaemonUrl).replace(/\/+$/, '');
+}
+
+async function probeTokenDaemon(baseOverride) {
+  const base = (baseOverride || await getTokenDaemonBase()).replace(/\/+$/, '');
+  try {
+    const resp = await fetch(`${base}/health`, { method: 'GET' });
+    const txt = await resp.text();
+    let json = null; try { json = JSON.parse(txt); } catch {}
+    return { ok: resp.ok, status: resp.status, base, body: json || txt.slice(0, 500) };
+  } catch (e) {
+    return { ok: false, base, error: e.message };
+  }
+}
+
+// Tolerant extractor — the daemon's /tokens shape isn't assumed. Pulls
+// candidate {token, locationId, expiry} from array/object/map responses.
+function extractTokenCandidates(data) {
+  const out = [];
+  const visit = (entry, keyHint) => {
+    if (!entry || typeof entry !== 'object') return;
+    const token = entry.token || entry.accessToken || entry.access_token ||
+                  entry.bearer || entry.value || entry.jwt || null;
+    if (!token || typeof token !== 'string' || token.length < 20) return;
+    let exp = entry.expiresAt || entry.expiry || entry.expiresIn || entry.exp ||
+              entry.validUntil || entry.updatedAt || 0;
+    if (typeof exp === 'string') { const n = Date.parse(exp); exp = isNaN(n) ? 0 : n; }
+    if (typeof exp === 'number' && exp > 0 && exp < 1e12) exp *= 1000; // sec→ms
+    const locationId = entry.locationId || entry.location || entry.locationID ||
+                       entry.companyId || keyHint || null;
+    out.push({ token, locationId: locationId ? String(locationId) : null, exp: exp || 0 });
+  };
+  if (Array.isArray(data)) data.forEach(e => visit(e));
+  else if (data && typeof data === 'object') {
+    if (Array.isArray(data.tokens)) data.tokens.forEach(e => visit(e));
+    else if (data.tokens && typeof data.tokens === 'object') {
+      for (const [k, v] of Object.entries(data.tokens)) visit(v, k);
+    } else {
+      for (const [k, v] of Object.entries(data)) visit(v, k);
+    }
+  }
+  return out;
+}
+
+async function fetchFreshToken(targetUrl) {
+  const base = await getTokenDaemonBase();
+  const resp = await fetch(`${base}/tokens`, { method: 'GET' });
+  if (!resp.ok) throw new Error(`token daemon /tokens returned ${resp.status}`);
+  const data = await resp.json().catch(() => null);
+  const cands = extractTokenCandidates(data);
+  if (cands.length === 0) throw new Error('no usable tokens from daemon');
+  const now = Date.now();
+  const fresh = cands.filter(c => !c.exp || c.exp > now);
+  const pool = fresh.length ? fresh : cands;
+  // Prefer a token whose locationId appears in the target URL
+  let url = '';
+  try { url = String(targetUrl); } catch {}
+  const matched = pool.filter(c => c.locationId && url.includes(c.locationId));
+  const ranked = (matched.length ? matched : pool).sort((a, b) => (b.exp || 0) - (a.exp || 0));
+  return ranked[0];
+}
+
+// -------------------------------------------------------------------------
+// Replay ("Test endpoint")
+// -------------------------------------------------------------------------
+
+const REPLAY_SKIP_HEADERS = new Set([
+  'host', 'content-length', 'connection', 'accept-encoding', 'cookie',
+  'authorization', 'token-id', 'origin', 'referer', 'user-agent',
+  'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-dest', 'pragma', 'cache-control'
+]);
+
+function redactRespHeadersObj(headersObj) {
+  if (!headersObj) return null;
+  const out = {};
+  headersObj.forEach((val, key) => {
+    const k = key.toLowerCase();
+    if (RESPONSE_HEADERS_DENY.has(k)) return;
+    out[k] = redactHeaderValue(k, val);
+  });
+  return Object.keys(out).length ? out : null;
+}
+
+async function replayEndpoint({ epKey, sampleIndex }) {
+  const [payloads, endpoints, settings] = await Promise.all([
+    getPayloads(), getEndpoints(), getSettings()
+  ]);
+  const entry = payloads[epKey];
+  const epMeta = endpoints[epKey];
+  if (!entry && !epMeta) throw new Error('endpoint not found');
+
+  const sample = (entry?.samples && entry.samples[sampleIndex || 0]) || entry || {};
+  const method = (sample.method || (epKey.split(' ')[0]) || 'GET').toUpperCase();
+  const url = sample.url || (epMeta?.sampleUrls && epMeta.sampleUrls[0]) || null;
+  if (!url) throw new Error('no concrete URL captured for this endpoint');
+
+  if (method !== 'GET' && !settings.allowMutatingReplay) {
+    throw new Error(`Replay blocked: ${method} can mutate data. Enable "Allow non-GET replay" in Settings to override.`);
+  }
+
+  // Rebuild headers: keep non-sensitive captured headers, inject fresh auth.
+  const headers = {};
+  const captured = sample.requestHeaders || {};
+  for (const [k, v] of Object.entries(captured)) {
+    if (REPLAY_SKIP_HEADERS.has(k.toLowerCase())) continue;
+    headers[k] = v;
+  }
+
+  let tokenInfo = null, tokenErr = null;
+  try {
+    tokenInfo = await fetchFreshToken(url);
+  } catch (e) { tokenErr = e.message; }
+  if (tokenInfo?.token) headers['authorization'] = `Bearer ${tokenInfo.token}`;
+
+  if (method !== 'GET' && sample.contentType) headers['content-type'] = sample.contentType;
+
+  const init = { method, headers, credentials: 'omit', cache: 'no-store' };
+  if (method !== 'GET' && method !== 'HEAD' && sample.requestBody) {
+    init.body = sample.requestBody;
+  }
+
+  const t0 = Date.now();
+  let resp, bodyText = '';
+  try {
+    resp = await fetch(url, init);
+    bodyText = await resp.text();
+  } catch (e) {
+    return { ok: false, error: `replay fetch failed: ${e.message}`, tokenErr };
+  }
+  const latencyMs = Date.now() - t0;
+  if (bodyText.length > 1048576) bodyText = bodyText.slice(0, 1048576) + '...[TRUNCATED]';
+
+  // Persist as a replay sample. Redact the fresh token before storage.
+  const storedReqHeaders = { ...headers };
+  if (storedReqHeaders['authorization']) {
+    const a = storedReqHeaders['authorization'];
+    storedReqHeaders['authorization'] = a.length > 60
+      ? a.slice(0, 20) + '...' + a.slice(-10) : a;
+  }
+  await storePayload(epKey, {
+    method,
+    url,
+    status: resp.status,
+    contentType: resp.headers.get('content-type') || null,
+    requestBody: init.body || null,
+    responseBody: bodyText,
+    requestHeaders: storedReqHeaders,
+    responseHeaders: redactRespHeadersObj(resp.headers),
+    authHeaders: tokenInfo ? { authorization: 'Bearer …(fresh)' } : (sample.authHeaders || null),
+    source: 'replay',
+    timestamp: Date.now()
+  });
+
+  // Upgrade the endpoint's recorded auth type
+  if (tokenInfo?.token && epMeta) {
+    epMeta.authType = 'bearer';
+    epMeta.lastReplayedAt = Date.now();
+    await chrome.storage.local.set({ endpoints });
+  }
+
+  return {
+    ok: resp.ok,
+    status: resp.status,
+    latencyMs,
+    url,
+    method,
+    usedFreshToken: !!tokenInfo?.token,
+    tokenErr,
+    bodySnippet: bodyText.slice(0, 600)
+  };
+}
+
+// -------------------------------------------------------------------------
+// Force refetch — reload an open GHL app tab bypassing cache so the SPA
+// re-issues the cached call with its own valid auth (captured normally).
+// -------------------------------------------------------------------------
+
+async function forceRefetch() {
+  const tabs = await chrome.tabs.query({});
+  const ghlRe = /:\/\/([^/]+\.)?(gohighlevel\.com|leadconnectorhq\.com|msgsndr\.com)\//i;
+  const ghlTabs = tabs.filter(t => t.url && ghlRe.test(t.url));
+  if (ghlTabs.length === 0) {
+    return { ok: false, error: 'No open GoHighLevel tab. Open the page that loads this endpoint, then retry.' };
+  }
+  // Prefer the active, most-recently-used GHL tab
+  ghlTabs.sort((a, b) => (b.active - a.active) || ((b.lastAccessed || 0) - (a.lastAccessed || 0)));
+  const tab = ghlTabs[0];
+  await chrome.tabs.reload(tab.id, { bypassCache: true });
+  return { ok: true, reloadedTabId: tab.id, url: tab.url, tabCount: ghlTabs.length };
+}
+
 async function pushPayloadToVault(epKey, payloadData) {
   try {
     const vc = await getVaultConfig();
@@ -1568,6 +1765,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return;
   }
 
+  // Resource Timing discovery: a GHL API call seen only via Performance
+  // Observer (SPA/bfcache cached, fetch/XHR never fired). Record the URL
+  // and flag it for force-refetch. No body/auth available here.
+  if (msg.action === 'resourceSeen') {
+    const data = msg.data;
+    if (!data || !data.url) return;
+    getCaptureState().then(state => {
+      if (!state.isCapturing) return;
+      recordEndpoint({
+        method: 'GET',
+        url: data.url,
+        headers: [],
+        statusCode: null,
+        discoveredVia: 'resource-timing',
+        needsRefetch: true
+      });
+    });
+    return;
+  }
+
   if (msg.action === 'getEndpoints') {
     getEndpoints().then(sendResponse);
     return true;
@@ -1768,6 +1985,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === 'reschedSync') {
     rescheduleSyncAlarm()
       .then(() => sendResponse({ ok: true }))
+      .catch(err => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+
+  if (msg.action === 'probeTokenDaemon') {
+    probeTokenDaemon(msg.url)
+      .then(sendResponse)
+      .catch(err => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+
+  if (msg.action === 'replayEndpoint') {
+    replayEndpoint({ epKey: msg.epKey, sampleIndex: msg.sampleIndex })
+      .then(result => sendResponse(result))
+      .catch(err => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+
+  if (msg.action === 'forceRefetch') {
+    forceRefetch()
+      .then(result => sendResponse(result))
       .catch(err => sendResponse({ ok: false, error: err.message }));
     return true;
   }

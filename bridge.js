@@ -31,4 +31,14 @@ window.addEventListener('message', (event) => {
     }).catch(() => {});
     return;
   }
+
+  if (t === '__GHL_RESOURCE_SEEN__') {
+    const payload = event.data.payload;
+    if (!payload || !payload.url) return;
+    chrome.runtime.sendMessage({
+      action: 'resourceSeen',
+      data: payload
+    }).catch(() => {});
+    return;
+  }
 });

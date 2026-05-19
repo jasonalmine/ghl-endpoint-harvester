@@ -486,6 +486,54 @@
   } catch {}
 
   // -----------------------------------------------------------------------
+  // Resource Timing discovery — find SPA/bfcache-served GHL API calls that
+  // fetch/XHR never observe (served from memory). We can only see the URL
+  // here (no body, no auth); background flags it needsRefetch so it can be
+  // force-refetched later with full body + headers.
+  // -----------------------------------------------------------------------
+
+  const __seenResourceUrls = new Set();
+
+  function reportResource(url) {
+    try {
+      if (!url || !isApiUrl(url)) return;
+      // Strip volatile cache-buster-ish values but keep the path; dedupe per page.
+      const key = url.split('#')[0];
+      if (__seenResourceUrls.has(key)) return;
+      __seenResourceUrls.add(key);
+      if (__seenResourceUrls.size > 2000) {
+        __seenResourceUrls.delete(__seenResourceUrls.values().next().value);
+      }
+      window.postMessage({
+        type: '__GHL_RESOURCE_SEEN__',
+        payload: { url: key, pageUrl: location.href, timestamp: Date.now() }
+      }, '*');
+    } catch {}
+  }
+
+  try {
+    // Sweep resources already loaded before this observer attached
+    // (these are exactly the ones served from cache on revisit).
+    if (performance && performance.getEntriesByType) {
+      for (const e of performance.getEntriesByType('resource')) {
+        if (e.initiatorType === 'fetch' || e.initiatorType === 'xmlhttprequest') {
+          reportResource(e.name);
+        }
+      }
+    }
+    if (typeof PerformanceObserver !== 'undefined') {
+      const po = new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+          if (e.initiatorType === 'fetch' || e.initiatorType === 'xmlhttprequest') {
+            reportResource(e.name);
+          }
+        }
+      });
+      po.observe({ type: 'resource', buffered: true });
+    }
+  } catch {}
+
+  // -----------------------------------------------------------------------
   // Console marker (visible in DevTools)
   // -----------------------------------------------------------------------
 
