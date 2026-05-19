@@ -40,8 +40,109 @@ const DEFAULT_SETTINGS = {
   autoCaptureOnStartup: true,
   maxEndpoints: 500,
   domains: [...GHL_DOMAINS],
-  exportFormat: 'json'
+  exportFormat: 'json',
+  // Local ghl-token-harvester daemon (configurable; verified via GET /health).
+  tokenDaemonUrl: 'http://127.0.0.1:7787',
+  // Replay is GET-only unless this is explicitly enabled (writes can mutate
+  // real client data).
+  allowMutatingReplay: false
 };
+
+// Response headers worth keeping (skip CORS/cache noise) — mirrors the
+// interceptor's deny list so webRequest-captured headers match.
+const RESPONSE_HEADERS_DENY = new Set([
+  'access-control-allow-origin', 'access-control-allow-credentials',
+  'access-control-allow-methods', 'access-control-allow-headers',
+  'access-control-expose-headers', 'access-control-max-age',
+  'strict-transport-security', 'cross-origin-resource-policy',
+  'cross-origin-opener-policy', 'referrer-policy', 'x-content-type-options',
+  'x-frame-options', 'x-xss-protection', 'vary', 'server', 'date'
+]);
+
+const SENSITIVE_HEADERS = new Set([
+  'authorization', 'token-id', 'x-api-key', 'api-key', 'cookie', 'set-cookie'
+]);
+const AUTH_HEADER_KEYS = new Set([
+  'authorization', 'token-id', 'channel', 'source', 'version',
+  'x-api-key', 'version-control'
+]);
+
+// Query params that signal pagination, grouped by style.
+const PAGINATION_PARAMS = {
+  page:   ['page', 'pagenumber', 'pageno', 'pageindex', 'tabindex'],
+  offset: ['offset', 'skip', 'start', 'from'],
+  cursor: ['cursor', 'startafter', 'nextpagetoken', 'pagetoken', 'after', 'searchafter']
+};
+const PAGINATION_HINT_PARAMS = ['limit', 'pagesize', 'persize', 'perpage', 'pagelimit', 'count', 'bulkreqid'];
+
+function redactHeaderValue(name, val) {
+  if (val == null) return val;
+  const v = String(val);
+  if (SENSITIVE_HEADERS.has(name) && v.length > 60) {
+    return v.substring(0, 20) + '...' + v.substring(v.length - 10);
+  }
+  return v;
+}
+
+// webRequest requestHeaders array -> { requestHeaders, authHeaders } (redacted)
+function redactRequestHeaderList(headers) {
+  if (!headers || headers.length === 0) return { requestHeaders: null, authHeaders: null };
+  const requestHeaders = {};
+  const authHeaders = {};
+  for (const h of headers) {
+    const name = (h.name || '').toLowerCase();
+    if (!name) continue;
+    const stored = redactHeaderValue(name, h.value || '');
+    requestHeaders[name] = stored;
+    if (AUTH_HEADER_KEYS.has(name)) authHeaders[name] = stored;
+  }
+  return {
+    requestHeaders: Object.keys(requestHeaders).length ? requestHeaders : null,
+    authHeaders: Object.keys(authHeaders).length ? authHeaders : null
+  };
+}
+
+// webRequest responseHeaders array -> redacted object (skips noise)
+function redactResponseHeaderList(headers) {
+  if (!headers || headers.length === 0) return null;
+  const out = {};
+  for (const h of headers) {
+    const name = (h.name || '').toLowerCase();
+    if (!name || RESPONSE_HEADERS_DENY.has(name)) continue;
+    out[name] = redactHeaderValue(name, h.value || '');
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function getResponseContentType(headers) {
+  if (!headers) return null;
+  for (const h of headers) {
+    if ((h.name || '').toLowerCase() === 'content-type') return h.value || null;
+  }
+  return null;
+}
+
+// Detect pagination from a list of query param names (lowercased compare).
+function detectPagination(queryParams) {
+  if (!queryParams || queryParams.length === 0) return null;
+  const lower = queryParams.map(p => String(p).toLowerCase());
+  const matched = [];
+  let style = null;
+  for (const [st, names] of Object.entries(PAGINATION_PARAMS)) {
+    for (const n of names) {
+      if (lower.includes(n)) { matched.push(n); style = style || st; }
+    }
+  }
+  const hints = PAGINATION_HINT_PARAMS.filter(n => lower.includes(n));
+  if (matched.length === 0 && hints.length === 0) return null;
+  // hint-only (e.g. just ?limit=) isn't conclusively paginated
+  const paginated = matched.length > 0;
+  return {
+    paginated,
+    style: style || (paginated ? 'page' : null),
+    params: [...new Set([...matched, ...hints])]
+  };
+}
 
 // -------------------------------------------------------------------------
 // Official GHL API v2 endpoint patterns (for auto-classification)
@@ -740,6 +841,17 @@ async function flushBuffer() {
       if (update.authType === 'bearer') existing.authType = 'bearer';
       else if (update.authType === 'apikey' && existing.authType === 'none') existing.authType = 'apikey';
 
+      // Pagination: recompute from the (now-merged) full query param set
+      const pg = detectPagination(existing.queryParams);
+      if (pg) existing.pagination = pg;
+
+      // A real network capture (has a status code) clears the refetch flag
+      if (update.statusCodes.length > 0) existing.needsRefetch = false;
+      // Only keep discoveredVia until a real capture supersedes it
+      if (update.statusCodes.length > 0 && existing.discoveredVia === 'resource-timing') {
+        delete existing.discoveredVia;
+      }
+
     } else {
       // Enforce max endpoints limit
       const currentCount = Object.keys(endpoints).length;
@@ -757,6 +869,9 @@ async function flushBuffer() {
         statusCodes: update.statusCodes,
         authType: update.authType,
         apiStatus: classifyEndpoint(update.method, update.pattern),
+        pagination: detectPagination(update.queryParams) || undefined,
+        discoveredVia: update.discoveredVia || undefined,
+        needsRefetch: update.needsRefetch || (update.statusCodes.length === 0 && update.discoveredVia === 'resource-timing') || undefined,
         tags: [],
         notes: '',
         starred: false
@@ -777,7 +892,7 @@ async function flushBuffer() {
   }
 }
 
-function recordEndpoint({ method, url, headers, statusCode }) {
+function recordEndpoint({ method, url, headers, statusCode, discoveredVia, needsRefetch }) {
   if (shouldIgnore(url)) return;
 
   try {
@@ -804,6 +919,8 @@ function recordEndpoint({ method, url, headers, statusCode }) {
         if (writeBuffer[epKey].sampleUrls.length > 3) writeBuffer[epKey].sampleUrls.pop();
       }
       if (authType === 'bearer') writeBuffer[epKey].authType = 'bearer';
+      if (discoveredVia && !writeBuffer[epKey].discoveredVia) writeBuffer[epKey].discoveredVia = discoveredVia;
+      if (needsRefetch) writeBuffer[epKey].needsRefetch = true;
     } else {
       writeBuffer[epKey] = {
         method,
@@ -815,7 +932,9 @@ function recordEndpoint({ method, url, headers, statusCode }) {
         sampleUrls: [url],
         queryParams,
         statusCodes: statusCode ? [statusCode] : [],
-        authType
+        authType,
+        discoveredVia: discoveredVia || null,
+        needsRefetch: !!needsRefetch
       };
     }
 
@@ -944,53 +1063,61 @@ async function setupListeners() {
         statusCode: details.statusCode || null
       });
 
-      // If we captured a request body via onBeforeRequest, store as payload
+      let epKey, normalizedPath;
+      try {
+        const u = new URL(details.url);
+        normalizedPath = normalizePath(u.pathname);
+        epKey = `${method} ${normalizedPath}`;
+      } catch { return; }
+
+      const { requestHeaders, authHeaders } = redactRequestHeaderList(headers);
+      const responseHeaders = redactResponseHeaderList(details.responseHeaders);
+      const contentType = getResponseContentType(details.responseHeaders);
+
+      // Body path: fetch/XHR/onBeforeRequest gave us a request body.
       const bodyEntry = requestBodies.get(details.requestId);
       if (bodyEntry) {
         requestBodies.delete(details.requestId);
         try {
-          const u = new URL(details.url);
-          const normalizedPath = normalizePath(u.pathname);
-          const epKey = `${method} ${normalizedPath}`;
-
-          // Capture ALL request headers (with token redaction) so requests
-          // can be replayed / inspected for workflow extraction.
-          let requestHeaders = null;
-          let authHeaders = null;
-          if (headers && headers.length > 0) {
-            const SENSITIVE = new Set(['authorization', 'token-id', 'x-api-key', 'api-key', 'cookie']);
-            const AUTH_KEYS = new Set(['authorization', 'token-id', 'channel', 'source', 'version', 'x-api-key', 'version-control']);
-            requestHeaders = {};
-            const auth = {};
-            for (const h of headers) {
-              const name = h.name.toLowerCase();
-              const val = h.value || '';
-              const stored = SENSITIVE.has(name) && val.length > 60
-                ? val.substring(0, 20) + '...' + val.substring(val.length - 10)
-                : val;
-              requestHeaders[name] = stored;
-              if (AUTH_KEYS.has(name)) auth[name] = stored;
-            }
-            if (Object.keys(auth).length > 0) authHeaders = auth;
-            if (Object.keys(requestHeaders).length === 0) requestHeaders = null;
-          }
-
           storePayload(epKey, {
             method,
             url: details.url,
             status: details.statusCode || null,
-            contentType: null,
+            contentType,
             requestBody: bodyEntry.body,
             responseBody: null,
             requestHeaders,
-            responseHeaders: null,
+            responseHeaders,
             authHeaders,
+            source: 'webRequest',
+            fromCache: !!details.fromCache,
             timestamp: bodyEntry.timestamp
+          });
+        } catch {}
+        return;
+      }
+
+      // Header-only path: no request body (GETs, incl. SPA cache / 304 hits
+      // that fetch/XHR never observes). Persist the auth/headers so the
+      // endpoint stays replayable even when served from cache.
+      if (requestHeaders || authHeaders) {
+        try {
+          storeHeaderCapture(epKey, {
+            method,
+            url: details.url,
+            status: details.statusCode || null,
+            contentType,
+            requestHeaders,
+            responseHeaders,
+            authHeaders,
+            fromCache: !!details.fromCache,
+            timestamp: Date.now()
           });
         } catch {}
       }
     },
-    { urls: urlPatterns }
+    { urls: urlPatterns },
+    ['responseHeaders', 'extraHeaders']
   );
 
   // Also handle errors (still want to log the endpoint attempt)
@@ -1207,11 +1334,61 @@ const MAX_SAMPLES_PER_ENDPOINT = 5;
 const MAX_PAYLOAD_ENTRIES = 1000;
 
 function sampleSignature(data) {
-  // Hash request body shape so we only keep meaningfully different samples.
+  // Fingerprint a sample so only meaningfully-different ones are kept.
+  // Includes method + source class so a header-only sample can never
+  // dedupe-collapse (and thus evict) a real body sample for the same epKey.
   const body = data.requestBody || '';
   const status = data.status || 0;
-  // Cheap fingerprint: status + body length + first 200 chars
-  return `${status}|${body.length}|${body.substring(0, 200)}`;
+  const headerOnly = (!data.requestBody && !data.responseBody) ? 'H' : 'B';
+  const src = data.source || '';
+  return `${headerOnly}|${src}|${data.method || ''}|${status}|${body.length}|${body.substring(0, 200)}`;
+}
+
+// Pick the "richest" sample for the backward-compat top-level mirror:
+// prefer one with a response body, then a request body, then most recent.
+// Prevents header-only / replay captures from regressing the visible payload.
+function pickPrimarySample(samples) {
+  if (!samples || samples.length === 0) return null;
+  return (
+    samples.find(s => s.responseBody) ||
+    samples.find(s => s.requestBody) ||
+    samples[0]
+  );
+}
+
+function seedSamplesFromLegacy(existing) {
+  const samples = existing?.samples ? [...existing.samples] : [];
+  if (existing && samples.length === 0 && (existing.requestBody || existing.responseBody || existing.requestHeaders)) {
+    samples.push({
+      method: existing.method,
+      url: existing.url,
+      status: existing.status,
+      contentType: existing.contentType,
+      requestBody: existing.requestBody || null,
+      responseBody: existing.responseBody || null,
+      requestHeaders: existing.requestHeaders || null,
+      responseHeaders: existing.responseHeaders || null,
+      authHeaders: existing.authHeaders || null,
+      source: existing.source || 'legacy',
+      capturedAt: existing.capturedAt
+    });
+  }
+  return samples;
+}
+
+// Shared tail: cap entries, persist, auto-push to vault.
+async function persistPayloads(payloads, epKey) {
+  const keys = Object.keys(payloads);
+  if (keys.length > MAX_PAYLOAD_ENTRIES) {
+    const sorted = keys.sort((a, b) => (payloads[a].capturedAt || 0) - (payloads[b].capturedAt || 0));
+    const toRemove = sorted.slice(0, keys.length - MAX_PAYLOAD_ENTRIES);
+    toRemove.forEach(k => delete payloads[k]);
+  }
+  await chrome.storage.local.set({ payloads });
+  const vc = await getVaultConfig();
+  if (vc.autoPush && vc.vaultUrl && payloads[epKey]) {
+    pushPayloadToVault(epKey, payloads[epKey]);
+  }
 }
 
 async function storePayload(epKey, data) {
@@ -1228,57 +1405,77 @@ async function storePayload(epKey, data) {
     requestHeaders: data.requestHeaders || null,
     responseHeaders: data.responseHeaders || null,
     authHeaders: data.authHeaders || null,
+    source: data.source || 'capture',
+    fromCache: data.fromCache || false,
     capturedAt: data.timestamp || Date.now()
   };
 
-  // Maintain a samples[] array so multiple distinct request shapes survive.
-  // Top-level fields mirror the latest sample for backward-compat with popup.
-  let samples = existing?.samples ? [...existing.samples] : [];
-  // If a previous entry existed without samples[], seed from its top-level fields.
-  if (existing && samples.length === 0 && (existing.requestBody || existing.responseBody)) {
-    samples.push({
-      method: existing.method,
-      url: existing.url,
-      status: existing.status,
-      contentType: existing.contentType,
-      requestBody: existing.requestBody,
-      responseBody: existing.responseBody,
-      requestHeaders: existing.requestHeaders || null,
-      responseHeaders: existing.responseHeaders || null,
-      authHeaders: existing.authHeaders,
-      capturedAt: existing.capturedAt
-    });
-  }
+  let samples = seedSamplesFromLegacy(existing);
 
   const newSig = sampleSignature(newSample);
   const dupeIdx = samples.findIndex(s => sampleSignature(s) === newSig);
-  if (dupeIdx >= 0) {
-    samples.splice(dupeIdx, 1);
-  }
+  if (dupeIdx >= 0) samples.splice(dupeIdx, 1);
   samples.unshift(newSample);
   if (samples.length > MAX_SAMPLES_PER_ENDPOINT) samples = samples.slice(0, MAX_SAMPLES_PER_ENDPOINT);
 
+  const primary = pickPrimarySample(samples) || newSample;
   payloads[epKey] = {
-    ...newSample,
+    ...primary,
+    samples,
+    captureCount: (existing?.captureCount || 0) + 1,
+    lastReplayedAt: data.source === 'replay' ? newSample.capturedAt : (existing?.lastReplayedAt || undefined)
+  };
+
+  await persistPayloads(payloads, epKey);
+}
+
+// Header/auth-only capture for requests fetch/XHR never sees (SPA cache,
+// 304, bfcache-miss revalidation). Backfills auth onto an existing body
+// sample so it becomes replayable; otherwise records a header-only sample.
+async function storeHeaderCapture(epKey, data) {
+  if (!data.requestHeaders && !data.authHeaders) return;
+  const payloads = await getPayloads();
+  const existing = payloads[epKey];
+  let samples = seedSamplesFromLegacy(existing);
+
+  // Try to enrich the most recent sample that lacks request headers.
+  const target = samples.find(s => !s.requestHeaders);
+  if (target) {
+    target.requestHeaders = data.requestHeaders || target.requestHeaders;
+    target.authHeaders = data.authHeaders || target.authHeaders;
+    if (data.fromCache != null) target.fromCache = data.fromCache;
+    if (!target.url && data.url) target.url = data.url;
+  } else {
+    const hdrSample = {
+      method: data.method,
+      url: data.url,
+      status: data.status,
+      contentType: data.contentType || null,
+      requestBody: null,
+      responseBody: null,
+      requestHeaders: data.requestHeaders || null,
+      responseHeaders: data.responseHeaders || null,
+      authHeaders: data.authHeaders || null,
+      source: 'webRequest-headeronly',
+      fromCache: data.fromCache || false,
+      capturedAt: data.timestamp || Date.now()
+    };
+    const sig = sampleSignature(hdrSample);
+    const dupeIdx = samples.findIndex(s => sampleSignature(s) === sig);
+    if (dupeIdx >= 0) samples.splice(dupeIdx, 1);
+    samples.unshift(hdrSample);
+    if (samples.length > MAX_SAMPLES_PER_ENDPOINT) samples = samples.slice(0, MAX_SAMPLES_PER_ENDPOINT);
+  }
+
+  const primary = pickPrimarySample(samples);
+  payloads[epKey] = {
+    ...(existing || {}),
+    ...(primary || {}),
     samples,
     captureCount: (existing?.captureCount || 0) + 1
   };
 
-  // Enforce storage limit: evict oldest endpoints
-  const keys = Object.keys(payloads);
-  if (keys.length > MAX_PAYLOAD_ENTRIES) {
-    const sorted = keys.sort((a, b) => (payloads[a].capturedAt || 0) - (payloads[b].capturedAt || 0));
-    const toRemove = sorted.slice(0, keys.length - MAX_PAYLOAD_ENTRIES);
-    toRemove.forEach(k => delete payloads[k]);
-  }
-
-  await chrome.storage.local.set({ payloads });
-
-  // Auto-push to vault if configured
-  const vc = await getVaultConfig();
-  if (vc.autoPush && vc.vaultUrl) {
-    pushPayloadToVault(epKey, payloads[epKey]);
-  }
+  await persistPayloads(payloads, epKey);
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
